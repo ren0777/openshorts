@@ -51,10 +51,9 @@ const EFFECT_TO_ANIMATION = { pop: 'pop', glow: 'word-highlight', highlight: 'ka
 
 // Font size in the units /api/subtitle takes. The default (18) is what every
 // clip ships with (subtitles.AUTO_CAPTION_STYLE), so opening the modal and
-// applying never changes the captions. The range reaches 100 so the presets'
-// larger sizes (34-70) still fit on the slider.
+// applying never changes the captions.
 const FONT_SIZE_MIN = 12;
-const FONT_SIZE_MAX = 100;
+const FONT_SIZE_MAX = 36;
 
 // Characters per line at size M, per font: Anton is condensed, Montserrat
 // wide. Bigger text gets proportionally fewer, so a line still fits the 9:16
@@ -262,7 +261,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
     const fallbackPreviewStyle = {
         fontFamily: fontName,
         color: fontColor,
-        fontSize: '20px',
+        fontSize: `${fontSize}px`,
         fontWeight: 'bold',
         maxWidth: '85%',
         padding: '6px 12px',
@@ -375,7 +374,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                         <div>
                             <div className="flex justify-between mb-2">
                                 <p className="eyebrow">Font size</p>
-                                <span className="readout">{fontSize}</span>
+                                <span className="readout">{fontSize}px</span>
                             </div>
                             <div className="flex items-center gap-3">
                                 <input

@@ -69,7 +69,7 @@ reserves.
 
 - **Smaller default captions** (size 18, outline 3) for auto-captions and the
   "Default" preset, so they cover less of a 9:16 frame.
-- **Free font size slider + number box** (12–100) in the subtitle modal,
+- **Free font size slider + number box** (12–36 px) in the subtitle modal,
   instead of fixed S/M/L/XL steps.
 
 - **An Upload-Post key is no longer required to generate clips.** It is only
