@@ -212,6 +212,25 @@ _STATIC_OK_MARKERS = ('"playabilityStatus"', '"status":"OK"')
 _static_cookie_jar = None
 _static_cookie_src = None
 
+# The cookies themselves are a route: once Google rotates the session they
+# came from, every download is anonymous whatever the file says, the statics
+# get rate-limited into the bot-check one by one and jobs fall to per-GB
+# billing. That is invisible to the pool probe (one IP still answering = UP)
+# and to the ledger alert (it names the IPs, not the session). 30-sep-2026:
+# ~900 MB paid in 70 min, cap hit, and the watcher had said nothing; yt-dlp
+# had been warning "cookies are no longer valid" in every job log. The watch
+# page carries the same signal yt-dlp reads: ytcfg "LOGGED_IN".
+_COOKIE_TARGET = "YouTube session cookies"
+_session_seen = {"logged_in": None}
+
+
+def _note_session(body):
+    """Record what the watch page says about the cookie session, if anything."""
+    import re as _re
+    m = _re.search(r'"LOGGED_IN":(true|false)', body or "")
+    if m:
+        _session_seen["logged_in"] = m.group(1) == "true"
+
 
 def _probe_cookies():
     """The download's YOUTUBE_COOKIES as a jar httpx can send, or None.
@@ -303,6 +322,8 @@ async def _probe_one(proxy):
         if is_paid:
             return True, ""
         body = resp.text or ""
+        if "cookies" in kwargs:
+            _note_session(body)
         if all(m in body for m in _STATIC_OK_MARKERS):
             return True, ""
         # Name what YouTube actually said. "LOGIN_REQUIRED" with cookies
@@ -320,6 +341,13 @@ def _watch_severity(name):
     safety net, not an outage: the first version of this alert said "jobs
     will keep failing" for that case and read as the platform being down
     (27-aug-2026, a single ReadTimeout on the paid proxy)."""
+    if name == _COOKIE_TARGET:
+        return "🟠", "YouTube session cookies expired", (
+            "YouTube no longer recognises the session in YOUTUBE_COOKIES, so every "
+            "download runs anonymously: the static IPs get bot-checked and jobs fall "
+            "to the PER-GB proxy (and fail once its daily budget is hit). Fix: log in "
+            "to YouTube in a private window, export the cookies, close the window "
+            "without logging out, update YOUTUBE_COOKIES and redeploy.")
     static_down = bool(_watch_down.get(_STATIC_TARGET))
     paid_down = bool(_watch_down.get(_PAID_TARGET))
     other_configured = len(_watch_targets()) > 1
@@ -350,15 +378,18 @@ async def _watch_update(name, ok, detail):
             _watch_nag[name] = 0.0
         return
     _watch_strikes[name] = _watch_strikes.get(name, 0) + 1
+    # A rotated session is deterministic (the same answer on every IP), so
+    # it does not get the benefit of the doubt a flaky proxy gets.
+    strikes = 1 if name == _COOKIE_TARGET else _PROXY_STRIKES
     if not _watch_down.get(name):
-        if _watch_strikes[name] < _PROXY_STRIKES:
+        if _watch_strikes[name] < strikes:
             return  # one miss: wait for the next probe before saying anything
         _watch_down[name] = now
         _watch_nag[name] = now
         icon, headline, impact = _watch_severity(name)
         await send_admin_alert(
             f"{icon} {headline}",
-            f"{impact}\n\nThe {name} failed {_PROXY_STRIKES} probes in a row "
+            f"{impact}\n\nThe {name} failed {strikes} probe(s) in a row "
             f"({_PROXY_PROBE_INTERVAL // 60} min apart). This repeats every 2 h "
             f"until it answers again.\n\nProbe error: {detail[:400]}",
         )
@@ -381,6 +412,7 @@ async def proxy_watch_tick():
         await proxy_ledger.flush_alerts()
     except Exception:
         pass
+    _session_seen["logged_in"] = None
     for name, urls in _watch_targets():
         ok, detail = False, "no urls"
         for u in urls:
@@ -388,6 +420,12 @@ async def proxy_watch_tick():
             if ok:
                 break
         await _watch_update(name, ok, detail)
+    # Judged from the watch pages the static probes just fetched with the
+    # cookies attached; nothing to say when no static answered at all.
+    if _probe_cookies() is not None and _session_seen["logged_in"] is not None:
+        await _watch_update(_COOKIE_TARGET, _session_seen["logged_in"],
+                            'watch page ytcfg says "LOGGED_IN":false with the '
+                            'configured cookies attached')
 
 
 async def proxy_watch_loop():

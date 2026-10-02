@@ -9,7 +9,7 @@ import {
 } from "remotion";
 import type { SubtitleConfig } from "../lib/types";
 import { groupCaptionsIntoBlocks, getActiveWordIndex } from "../lib/captions";
-import { getFontStack } from "../lib/fonts";
+import { getFontStack, antonFontFace, montserratFontFace } from "../lib/fonts";
 
 interface SubtitlesProps {
   config: SubtitleConfig;
@@ -23,10 +23,15 @@ const POSITION_MAP: Record<string, React.CSSProperties> = {
 
 export const Subtitles: React.FC<SubtitlesProps> = ({ config }) => {
   const { fps } = useVideoConfig();
-  const blocks = groupCaptionsIntoBlocks(config.captions);
+  const blocks = groupCaptionsIntoBlocks(
+    config.captions,
+    config.maxChars ?? 20,
+    config.maxDurationMs ?? 2000
+  );
 
   return (
     <AbsoluteFill>
+      <style>{antonFontFace + montserratFontFace}</style>
       {blocks.map((block, i) => {
         const startFrame = Math.round((block.startMs / 1000) * fps);
         const durationFrames = Math.max(
@@ -113,6 +118,7 @@ const SubtitleBlock: React.FC<SubtitleBlockProps> = ({
             key={i}
             word={word.text}
             isActive={i === activeIndex}
+            hidden={!!style.reveal && activeIndex >= 0 && i > activeIndex}
             style={style}
             fontStack={fontStack}
             animation={style.animation}
@@ -130,6 +136,7 @@ const SubtitleBlock: React.FC<SubtitleBlockProps> = ({
 interface WordSpanProps {
   word: string;
   isActive: boolean;
+  hidden: boolean;
   style: SubtitleConfig["style"];
   fontStack: string;
   animation: SubtitleConfig["style"]["animation"];
@@ -142,6 +149,7 @@ interface WordSpanProps {
 const WordSpan: React.FC<WordSpanProps> = ({
   word,
   isActive,
+  hidden,
   style,
   fontStack,
   animation,
@@ -189,9 +197,9 @@ const WordSpan: React.FC<WordSpanProps> = ({
       case "karaoke": {
         extraStyle = {
           backgroundColor: style.highlightColor,
-          color: style.bgColor || "#000000",
+          color: style.highlightTextColor || style.bgColor || "#000000",
           borderRadius: 4,
-          padding: "2px 6px",
+          padding: "2px 10px",
         };
         break;
       }
@@ -216,6 +224,11 @@ const WordSpan: React.FC<WordSpanProps> = ({
           `0 -${style.borderWidth}px 0 ${style.borderColor}`,
         ].join(", ")
       : "none";
+  // Burn units -> preview px, same scale as the font size (3.85 * 0.85).
+  const dropShadow = style.shadow
+    ? `${style.shadow * 3}px ${style.shadow * 3}px ${style.shadow * 2}px rgba(0,0,0,0.55)`
+    : "";
+  const outline = strokeShadow === "none" ? "" : strokeShadow;
 
   return (
     <span
@@ -225,9 +238,10 @@ const WordSpan: React.FC<WordSpanProps> = ({
         fontWeight: 700,
         color: animation === "karaoke" && isActive ? undefined : color,
         textShadow:
-          animation !== "karaoke"
-            ? [strokeShadow, extraStyle.textShadow].filter(Boolean).join(", ")
-            : strokeShadow,
+          [outline, dropShadow, animation !== "karaoke" ? extraStyle.textShadow : ""]
+            .filter(Boolean)
+            .join(", ") || "none",
+        visibility: hidden ? "hidden" : "visible",
         transform,
         display: "inline-block",
         transition: "none",

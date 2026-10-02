@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Download, Share2, Instagram, Youtube, Video, AlertCircle, Loader2, Copy, Check, Wand2, Type, Calendar, Languages, FileText, Link2, Scissors, Crosshair, TrendingUp } from 'lucide-react';
 import { getApiUrl } from '../config';
 import { apiFetch } from '../lib/api';
@@ -36,8 +36,22 @@ function formatDuration(clip) {
     return `${String(Math.floor(secs / 60)).padStart(2, '0')}:${String(secs % 60).padStart(2, '0')}`;
 }
 
-export default function ResultCard({ clip, index, jobId, durable, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, isManaged, onPlay, onPause, onBulkSubtitle, clipCount = 1, bulkProgress, initialState = null, onStateChange, connectedPlatforms = null, onConnectSocials, onEditClip = null, onReframeClip = null }) {
+export default function ResultCard({ clip, index, jobId, durable, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, isManaged, onPlay, onPause, onBulkSubtitle, clipCount = 1, bulkProgress, initialState = null, onStateChange, connectedPlatforms = null, onConnectSocials, onEditClip = null, onReframeClip = null, onUpgrade = null }) {
     const [showModal, setShowModal] = useState(false);
+    // The "why" line is clamped to two lines so cards in a row stay level;
+    // when it overflows, a hover (desktop) or tap (touch) shows the whole
+    // sentence in a popover that floats over the card instead of growing it.
+    const whyRef = useRef(null);
+    const [whyOpen, setWhyOpen] = useState(false);
+    const [whyClamped, setWhyClamped] = useState(false);
+    useEffect(() => {
+        const el = whyRef.current;
+        if (!el) return;
+        const check = () => setWhyClamped(el.scrollHeight > el.clientHeight + 1);
+        check();
+        window.addEventListener('resize', check);
+        return () => window.removeEventListener('resize', check);
+    }, [clip.why]);
     const [showDescModal, setShowDescModal] = useState(false);
     const [showSubtitleModal, setShowSubtitleModal] = useState(false);
     const [showWatermarkModal, setShowWatermarkModal] = useState(false);
@@ -450,6 +464,10 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                     effect: options.effect || 'none',
                     base_opacity: options.baseOpacity ?? 1.0,
                     uppercase: options.uppercase || false,
+                    reveal: options.reveal || false,
+                    shadow: options.shadow || 0,
+                    max_chars: options.maxChars ?? null,
+                    max_duration: options.maxDuration ?? null,
                     input_filename: serverVideoFile,
                     // Edited caption text (clip-relative ms); null = server
                     // regenerates from the transcript as before.
@@ -525,7 +543,8 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                     text: payload.text,
                     position: payload.position,
                     size: payload.size,
-                    style: payload.style || 'classic',
+                    style: payload.style || 'pill',
+                    font: payload.font || null,
                     duration_seconds: payload.remotion?.displayDurationSec ?? null,
                     input_filename: serverVideoFile
                 })
@@ -816,6 +835,32 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                     <h3 className="text-base font-medium text-ink leading-tight line-clamp-2 mb-2 break-words" title={clip.video_title_for_youtube_short}>
                         {clip.video_title_for_youtube_short || "Viral Clip Generated"}
                     </h3>
+                    {/* The score alone says how much, not why. One line from
+                        the selection pass on what this moment has going for it. */}
+                    {clip.why && (
+                        <div
+                            className="relative mb-2"
+                            onMouseEnter={() => setWhyOpen(true)}
+                            onMouseLeave={() => setWhyOpen(false)}
+                        >
+                            <p
+                                ref={whyRef}
+                                className={`text-xs text-muted leading-snug line-clamp-2 break-words ${whyClamped ? 'cursor-pointer' : ''}`}
+                                onClick={() => whyClamped && setWhyOpen(v => !v)}
+                                aria-label="why openshorts picked this moment"
+                            >
+                                {clip.why}
+                            </p>
+                            {whyClamped && whyOpen && (
+                                <div
+                                    role="tooltip"
+                                    className="absolute left-0 right-0 top-full mt-1 z-20 bg-paper border border-rule rounded-input px-3 py-2 text-xs text-ink leading-snug shadow-lg"
+                                >
+                                    {clip.why}
+                                </div>
+                            )}
+                        </div>
+                    )}
                     <div className="flex flex-wrap gap-1.5">
                         {durationReadout && <span className="readout bg-paper3 px-2 py-0.5 rounded-full shrink-0">{durationReadout}</span>}
                         {resolution && <span className="readout bg-paper3 px-2 py-0.5 rounded-full shrink-0">{resolution}</span>}
@@ -826,7 +871,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
 
                 {/* Descriptions (compact) — full text lives in the modal */}
                 <div className="flex-1 min-h-0 space-y-2 mb-4">
-                    <div className="bg-paper rounded-input px-3 py-2 border border-rule flex items-center gap-2 min-w-0">
+                    <div className="bg-paper rounded-input px-3 py-2 border border-rule flex items-center gap-2 min-w-0 overflow-hidden">
                         <span className="eyebrow shrink-0">YOUTUBE</span>
                         <p className="text-xs text-ink2 truncate flex-1 min-w-0">
                             {clip.video_title_for_youtube_short || "Viral Short Video"}
@@ -840,7 +885,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                         </button>
                     </div>
 
-                    <div className="bg-paper rounded-input px-3 py-2 border border-rule flex items-center gap-2 min-w-0">
+                    <div className="bg-paper rounded-input px-3 py-2 border border-rule flex items-center gap-2 min-w-0 overflow-hidden">
                         <span className="eyebrow shrink-0">TIKTOK · IG</span>
                         <p className="text-xs text-ink2 truncate flex-1 min-w-0">
                             {clip.video_description_for_tiktok || clip.video_description_for_instagram}
@@ -871,7 +916,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                 )}
 
                 {/* Actions Footer */}
-                <div className="grid grid-cols-2 gap-2 mt-auto pt-4 border-t border-rule">
+                <div className="grid grid-cols-[repeat(auto-fill,minmax(104px,1fr))] gap-2 mt-auto pt-4 border-t border-rule">
                     {onEditClip && (
                         <button
                             onClick={() => onEditClip(index)}
@@ -916,7 +961,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                         className={QUIET_BTN}
                     >
                         {isHooking ? <Loader2 size={16} className="animate-spin text-brass shrink-0" /> : <Wand2 size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />}
-                        {isHooking ? 'adding…' : 'viral hook'}
+                        {isHooking ? 'saving…' : 'edit hook'}
                     </button>
 
                     <button
@@ -939,7 +984,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                             e.preventDefault();
                             // Free clips are watermarked — surface the upsell once
                             // before the first download, then get out of the way.
-                            if (plan === 'free' && !watermarkNoticeDismissed()) {
+                            if (plan === 'free' && !watermarkNoticeDismissed(jobId)) {
                                 setShowWatermarkModal(true);
                                 return;
                             }
@@ -1158,6 +1203,9 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
 
             {showWatermarkModal && (
                 <WatermarkModal
+                    source="download"
+                    jobId={jobId}
+                    onUpgrade={onUpgrade}
                     onClose={() => setShowWatermarkModal(false)}
                     onContinue={downloadClip}
                 />

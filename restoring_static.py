@@ -68,4 +68,9 @@ class RestoringStaticFiles(StaticFiles):
                 restored = False
             if not restored:
                 raise
+            # The guard may read the job directory (a free job's clean twins
+            # are refused by a marker file that only exists once the files
+            # are back), so the verdict before the restore is not final.
+            if self.guard is not None and not self.guard(path):
+                raise HTTPException(status_code=404)
             return await super().get_response(path, scope)

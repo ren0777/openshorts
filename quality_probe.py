@@ -38,6 +38,20 @@ def main() -> int:
     args = parser.parse_args()
 
     result = {"max_height": 0, "mode": None, "cookies_invalid": False, "duration": 0}
+    # Same gates as the metering probe and the download (app.py also checks
+    # before spawning this): a URL on a private / tailnet address, or a
+    # YouTube page that is not one video, never reaches yt-dlp. The empty
+    # result is the fail-open "unknown", so the caller carries on and the
+    # real probe / download refuse the URL with their own message.
+    try:
+        from security_utils import assert_public_url
+        from yt_clients import youtube_non_video_reason
+        assert_public_url(args.url)
+        if youtube_non_video_reason(args.url):
+            raise ValueError("not a single video")
+    except Exception:
+        print(json.dumps(result))
+        return 0
     try:
         import yt_dlp
 
@@ -63,8 +77,10 @@ def main() -> int:
             'logger': _CollectLogger(),
             'socket_timeout': 20,
             'retries': 2,
-            'nocheckcertificate': True,
             'cachedir': False,
+            # A watch?v=X&list=... link is the one video; without this
+            # yt-dlp walks the whole list (see cloud/metering.py).
+            'noplaylist': True,
         }
         # yt-dlp's default player clients (tv_downgraded/web_safari with
         # cookies, android_vr/web_safari anonymous) are the ones that still

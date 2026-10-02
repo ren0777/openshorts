@@ -70,14 +70,23 @@ async def ensure_profile(user) -> str:
     return username
 
 
-async def get_connect_url(username: str) -> str:
+# Where the connect page sends the user back to. A closed list: the value
+# comes from the client and ends up in a redirect.
+RETURN_TARGETS = {
+    "account": "/#/account?connected=1",
+    "autopilot": "/#app?tab=autopilot&connected=1",
+}
+
+
+async def get_connect_url(username: str, return_to: str = "account") -> str:
     """Generate a branded, single-use connection URL (~1h) for the user's socials."""
+    back = RETURN_TARGETS.get(return_to, RETURN_TARGETS["account"])
     payload = {
         "username": username,
         "logoImage": settings.openshorts_logo_url,
         "connectTitle": "Connect your social accounts",
         "connectDescription": "Link TikTok, Instagram and YouTube to post your shorts directly from OpenShorts.",
-        "redirectUrl": f"{settings.frontend_url}/#/account?connected=1",
+        "redirectUrl": f"{settings.frontend_url}{back}",
         "redirectButtonText": "Back to OpenShorts",
         "platforms": CONNECT_PLATFORMS,
         "showCalendar": True,  # keep the scheduling calendar available in the page
@@ -99,5 +108,5 @@ async def social_connect(request: Request):
     from .auth import get_current_user_required
     user = await get_current_user_required(request)
     username = await ensure_profile(user)
-    access_url = await get_connect_url(username)
+    access_url = await get_connect_url(username, request.query_params.get("return_to") or "account")
     return {"access_url": access_url}

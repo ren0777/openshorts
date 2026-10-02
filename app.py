@@ -31,6 +31,8 @@ from pydantic import BaseModel
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 import recut
 import layout_ranges
+import watermarked
+import media_auth
 
 load_dotenv()
 
@@ -69,6 +71,36 @@ QUALITY_GATE_MIN_HEIGHT = int(os.environ.get("QUALITY_GATE_MIN_HEIGHT", "720"))
 # failures were exactly this, one user retrying the same 24s video).
 MIN_SOURCE_SECONDS = int(os.environ.get("MIN_SOURCE_SECONDS", "45"))
 QUALITY_PROBE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "quality_probe.py")
+
+# Server credentials the pipeline subprocesses (main.py, quality_probe.py) never
+# read: main.py and everything it imports use GEMINI_API_KEY / LLM_* / the
+# proxies / YOUTUBE_COOKIES and nothing from cloud/. A child that runs yt-dlp
+# and ffmpeg on user-supplied URLs and files has no business holding the
+# Stripe key, the JWT signing secret or the database password; one exploit
+# in that stack would otherwise hand over all of them.
+CHILD_ENV_DENYLIST = frozenset({
+    "DATABASE_URL", "POSTGRES_PASSWORD", "JWT_SECRET",
+    "STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET",
+    "SMTP_USER", "SMTP_PASSWORD",
+    "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
+    "GOOGLE_CLIENT_SECRET",
+    "AGENTLEDGER_API_KEY",
+    "MANAGED_UPLOAD_POST_API_KEY", "MANAGED_GEMINI_API_KEY", "UPLOAD_POST_API_KEY",
+    "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY",
+    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+    "OPENPANEL_CLIENT_SECRET", "ELEVENLABS_API_KEY",
+})
+
+
+def child_env(base=None):
+    """A copy of the environment for a pipeline subprocess, minus the server
+    secrets in CHILD_ENV_DENYLIST. Callers add GEMINI_API_KEY themselves."""
+    env = dict(os.environ if base is None else base)
+    for name in CHILD_ENV_DENYLIST:
+        env.pop(name, None)
+    return env
+
+
 DISABLE_YOUTUBE_URL = os.environ.get("DISABLE_YOUTUBE_URL", "false").lower() in ("1", "true", "yes")
 
 # Every log line in this module is emoji-prefixed, and a Windows console is
@@ -234,7 +266,7 @@ def _maybe_send_quota_email(user):
     _last_quota_email[str(user.id)] = now
     from cloud.emails import send_out_of_minutes_email
     upgrade_url = f"{_cloud_config.settings.frontend_url}/#/pricing"
-    asyncio.create_task(send_out_of_minutes_email(user.email, upgrade_url))
+    asyncio.create_task(send_out_of_minutes_email(user.email, upgrade_url, user.id))
 
 
 def _check_probe_rate(user_id):
@@ -247,10 +279,75 @@ def _check_probe_rate(user_id):
     times.append(now)
 
 
-async def reserve_process_minutes(request, url, input_path, job_id):
+def partial_offer(minutes_required: float, minutes_remaining: float) -> int:
+    """Minutes of the source we can offer to clip instead of a 402, or 0.
+
+    The offer is the caller's whole remaining balance, floored to full minutes
+    (the reservation is in whole minutes), and only when it is both worth
+    clipping (``PARTIAL_MIN_MINUTES``) and actually shorter than the source.
+    """
+    from cloud import config as _cfg  # plain constants; importable with billing off
+    offer = int(math.floor(max(0.0, float(minutes_remaining or 0))))
+    if offer < _cfg.PARTIAL_MIN_MINUTES or offer >= minutes_required:
+        return 0
+    return offer
+
+
+def plan_partial_minutes(minutes_required: int, minutes_remaining: float, max_minutes):
+    """How many minutes to reserve for a source of ``minutes_required``.
+
+    Returns ``(reserve, partial)``: ``partial`` is None for a normal whole-video
+    job, or ``{"processed_minutes", "total_minutes"}`` when the caller asked
+    (``max_minutes``) to clip only the first part. The slice is capped by the
+    balance as well as by the request, so a client cannot name a bigger cut
+    than it can pay for; when the slice would be too small the request falls
+    through to the ordinary quota check (and its 402).
+    """
+    if max_minutes is None:
+        return minutes_required, None
+    try:
+        asked = float(max_minutes)
+    except (TypeError, ValueError):
+        return minutes_required, None
+    from cloud import config as _cfg
+    cap = int(math.floor(min(asked, max(0.0, float(minutes_remaining or 0)))))
+    if minutes_required <= cap or cap < _cfg.PARTIAL_MIN_MINUTES:
+        return minutes_required, None
+    return cap, {"processed_minutes": cap, "total_minutes": minutes_required}
+
+
+def free_overflow(plan, minutes_required, minutes_remaining, max_minutes, processed_before):
+    """What a free account gets for a source longer than its balance.
+
+    Returns ``(grant, max_minutes)``:
+
+    * ``grant`` is the whole (floored) balance when this is the account's first
+      video and it fits ``FIRST_VIDEO_MAX_MINUTES``: the video is clipped whole
+      and only the balance is charged, so it lands at zero.
+    * otherwise ``max_minutes`` becomes the balance, so the job clips the first
+      N minutes (``plan_partial_minutes``) instead of answering with the wall.
+
+    Anything else (a paid plan, a source that fits, a client that already named
+    its own cut) passes through untouched.
+    """
+    from cloud import config as _cfg
+    remaining = max(0.0, float(minutes_remaining or 0))
+    if plan != "free" or max_minutes is not None or minutes_required <= remaining:
+        return None, max_minutes
+    if (not processed_before and remaining >= 1
+            and minutes_required <= _cfg.FIRST_VIDEO_MAX_MINUTES):
+        return int(math.floor(remaining)), None
+    return None, remaining
+
+
+async def reserve_process_minutes(request, url, input_path, job_id, max_minutes=None):
     """Meter a managed /api/process request.
 
-    Returns (user_id, priority, reservation_id, plan).
+    Returns (user_id, priority, reservation_id, plan, partial).
+
+    ``partial`` is None unless the caller asked (``max_minutes``) to clip only
+    the first part of a source its balance cannot cover whole; then it is the
+    ``plan_partial_minutes`` dict and only that many minutes are reserved.
 
     BYOK / self-host requests don't consume minutes (priority 2, no reservation).
     For a managed (entitled, no BYOK header) request this probes the input
@@ -263,10 +360,10 @@ async def reserve_process_minutes(request, url, input_path, job_id):
     on the operator's key for free. Only skip metering when billing is off.
     """
     if not BILLING_ENABLED:
-        return None, 2, None, None
+        return None, 2, None, None, None
     user = await _user_from_request(request)
     if not managed_keys.has_active_entitlement(user):
-        return None, 2, None, None  # shouldn't happen (resolve_gemini would have 402'd)
+        return None, 2, None, None, None  # shouldn't happen (resolve_gemini would have 402'd)
 
     priority = _cloud_config.PLAN_PRIORITY.get(user.plan, 1)
 
@@ -290,6 +387,7 @@ async def reserve_process_minutes(request, url, input_path, job_id):
             "error": "quota_exceeded",
             "minutes_required": 1,
             "minutes_remaining": balance["remaining"],
+            "partial_minutes": 0,
         })
 
     # Probe rate limit: probing costs a (cheap) proxied metadata call. The
@@ -300,6 +398,7 @@ async def reserve_process_minutes(request, url, input_path, job_id):
     # Probe input duration (blocking → run in a thread). When today's paid
     # traffic is over budget, the probe (and below, the job itself) runs
     # without the per-GB proxy: statics or nothing.
+    paid_allowed = True
     try:
         from cloud import proxy_ledger as _pl
         paid_allowed = not await _pl.budget_exceeded()
@@ -313,7 +412,12 @@ async def reserve_process_minutes(request, url, input_path, job_id):
                                         allow_paid=paid_allowed))
         else:
             minutes = await loop.run_in_executor(None, _metering.probe_file_minutes, input_path)
-    except Exception:
+    except Exception as e:
+        from yt_clients import NotASingleVideo
+        if isinstance(e, NotASingleVideo):
+            raise HTTPException(status_code=400, detail=(
+                f"{e} Paste the link of one video (youtube.com/watch?v=... "
+                "or youtu.be/...)."))
         raise HTTPException(status_code=400,
                             detail="Could not determine the video duration. Try a different source.")
     finally:
@@ -325,18 +429,55 @@ async def reserve_process_minutes(request, url, input_path, job_id):
         except Exception:
             pass
     minutes = max(1, math.ceil(minutes))
+    # The probe already learned whether this video is bot-checked on every
+    # static IP; the download skips those attempts then (DOWNLOAD_SKIP_STATICS).
+    request.state.skip_statics = bool(url) and _metering.pop_statics_bot_checked(url)
 
+    # Free account past its balance: the first video (up to
+    # FIRST_VIDEO_MAX_MINUTES) is clipped whole for the balance; any other is
+    # clipped to the first N minutes. Neither sees the wall.
+    grant = None
+    ip_hash = ""
+    if balance.get("plan") == "free" and minutes > balance["remaining"] and max_minutes is None:
+        processed_before = await _metering.has_processed_before(user.id)
+        if not processed_before:
+            # One whole first video per network (FIRST_VIDEO_IP_WINDOW_DAYS),
+            # so a stack of Google accounts from one IP gets one, not many.
+            ip_hash = _metering.ip_fingerprint(request.client.host if request.client else "")
+            if await _metering.ip_had_first_video(ip_hash):
+                processed_before = True
+        grant, max_minutes = free_overflow("free", minutes, balance["remaining"],
+                                           max_minutes, processed_before)
+
+    # A source longer than the balance can be clipped in part instead of
+    # refused: the wall offers "the first N minutes" (``partial_minutes`` in
+    # the 402 below) and the client resubmits with ``max_minutes``.
+    if grant is not None:
+        reserve, partial = grant, None
+    else:
+        reserve, partial = plan_partial_minutes(minutes, balance["remaining"], max_minutes)
     try:
-        reservation_id = await _metering.reserve_minutes(user.id, minutes, job_id)
+        reservation_id = await _metering.reserve_minutes(user.id, reserve, job_id)
+        # Read by process_endpoint for the download's safety cut
+        # (SOURCE_CAP_MINUTES); kept off the return tuple on purpose. A granted
+        # first video is processed whole, so its cap is the probed length.
+        request.state.reserved_minutes = minutes if grant is not None else reserve
+        request.state.first_video = grant is not None
+        if grant is not None:
+            try:
+                await _metering.record_first_video(ip_hash, job_id)
+            except Exception as e:  # the grant stands; only the IP memory is lost
+                print(f"⚠️  Could not record first-video grant: {e}")
     except _metering.QuotaExceeded as e:
         _maybe_send_quota_email(user)
         raise HTTPException(status_code=402, detail={
             "error": "quota_exceeded",
             "minutes_required": e.required,
             "minutes_remaining": e.remaining,
+            "partial_minutes": partial_offer(e.required, e.remaining),
         })
 
-    return user.id, priority, reservation_id, user.plan
+    return user.id, priority, reservation_id, user.plan, partial
 
 
 async def reserve_managed_action(request, minutes, job_id, job_type):
@@ -426,6 +567,62 @@ publish_jobs: Dict[str, Dict] = {}  # {publish_id: {status, result, error}}
 concurrency_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
 
+# Queue position + ETA for /api/status. ``_admitting`` holds jobs already taken
+# off the queue that wait for a free slot / GPU room: they go before anything
+# still queued. Durations are a rolling sample of this instance's finished jobs.
+_admitting: set = set()
+_recent_job_seconds: list = []
+DEFAULT_JOB_SECONDS = 240
+
+
+def _record_job_duration(seconds):
+    if seconds and seconds > 0:
+        _recent_job_seconds.append(float(seconds))
+        del _recent_job_seconds[:-30]
+
+
+def queue_estimate(ahead: int, running: int, slots: int, typical_seconds: float) -> int:
+    """Seconds until a job with ``ahead`` jobs in front of it starts.
+
+    With a slot free it starts right away (a few seconds of admission);
+    otherwise each full round of ``slots`` jobs ahead costs about one typical
+    job, since the running ones are on average half done.
+    """
+    slots = max(1, int(slots))
+    free = max(0, slots - int(running))
+    if ahead < free:
+        return 15
+    waiting = ahead - free + 1
+    rounds = waiting / slots
+    return int(max(30, round(typical_seconds * (0.5 + rounds - 1 / slots))))
+
+
+def queue_snapshot(job_id):
+    """``{position, ahead, eta_seconds}`` for a queued job, else None."""
+    job = jobs.get(job_id) or {}
+    if job.get('status') != 'queued':
+        return None
+    try:
+        entries = sorted(job_queue._queue)  # (priority, seq, job_id)
+    except Exception:
+        entries = []
+    queued_ids = [e[2] for e in entries
+                  if (jobs.get(e[2]) or {}).get('status') == 'queued']
+    if job_id in _admitting:
+        ahead = len([j for j in _admitting if j != job_id])
+    elif job_id in queued_ids:
+        ahead = len(_admitting) + queued_ids.index(job_id)
+    else:
+        return None
+    sample = sorted(_recent_job_seconds)
+    typical = sample[len(sample) // 2] if sample else DEFAULT_JOB_SECONDS
+    return {
+        "position": ahead + 1,
+        "ahead": ahead,
+        "eta_seconds": queue_estimate(ahead, len(_running_jobs), MAX_CONCURRENT_JOBS, typical),
+    }
+
+
 def _enqueue_job(job_id: str, priority: int = 2):
     job_queue.put_nowait((priority, next(_job_seq), job_id))
 
@@ -488,10 +685,13 @@ def _canonical_clip_file(output_dir, base_name, index):
         # captioned hooks; the bare recut_/hooked_/hook_ patterns cover
         # derivations that shipped uncaptioned (hook_ is the legacy manual-
         # hook prefix, kept so old jobs still resolve).
+        # wm_*{clean} is the free plan's marked copy of any of those (or of
+        # the clean file itself: the * matches nothing), written last.
         derived = (glob.glob(os.path.join(output_dir, f"subtitled_*_{clean}"))
                    + glob.glob(os.path.join(output_dir, f"recut_*_{clean}"))
                    + glob.glob(os.path.join(output_dir, f"hooked_*_{clean}"))
-                   + glob.glob(os.path.join(output_dir, f"hook_{clean}")))
+                   + glob.glob(os.path.join(output_dir, f"hook_{clean}"))
+                   + glob.glob(os.path.join(output_dir, f"wm_*{clean}")))
     except Exception:
         derived = []
     if not derived:
@@ -544,6 +744,21 @@ def _clips_actually_rendered(job_id, output_dir, base_name, clips):
     return kept, len(clips) - len(kept)
 
 
+def _strip_watermark_copy(output_dir, filename):
+    """``wm_<final>`` -> ``<final>`` when the clean twin is on disk.
+
+    The free plan serves a marked copy of the final file and keeps the clean
+    one next to it (see the ``watermarked`` module); every derivation starts
+    from the clean one, so the mark is always the outermost layer to strip.
+    Same fail-safe contract as the other walk-backs: unchanged when there is
+    nothing to strip or the twin is gone."""
+    if watermarked.is_marked(filename):
+        clean = watermarked.clean_name(filename)
+        if os.path.exists(os.path.join(output_dir, clean)):
+            return clean
+    return filename
+
+
 def _strip_burned_captions(output_dir, filename):
     """Walk ``subtitled_<ts>_`` prefixes back to the file without burned captions.
 
@@ -551,6 +766,7 @@ def _strip_burned_captions(output_dir, filename):
     underlying file is gone, e.g. a library restore that only kept the current
     version).
     """
+    filename = _strip_watermark_copy(output_dir, filename)
     while True:
         m = re.match(r'^subtitled_\d+_(.+)$', filename)
         if not m or not os.path.exists(os.path.join(output_dir, m.group(1))):
@@ -563,11 +779,86 @@ def _strip_burned_hook(output_dir, filename):
     without a burned hook. Same fail-safe contract as _strip_burned_captions:
     the name is returned unchanged when there is nothing to strip or the
     underlying file is gone."""
+    filename = _strip_watermark_copy(output_dir, filename)
     while True:
         m = re.match(r'^(?:hooked_\d+_|hook_)(.+)$', filename)
         if not m or not os.path.exists(os.path.join(output_dir, m.group(1))):
             return filename
         filename = m.group(1)
+
+
+async def _deliver(request, job_id, filename):
+    """The name to serve for a freshly derived clip file: the file itself, or
+    on the free plan its ``wm_`` copy (``main.mark_delivery``).
+
+    Decided from the caller's plan right now, not from the job's flag: the
+    flag is lost on a restart/restore, and a user who upgraded mid-session
+    must get clean files from their next edit on. Self-host never marks."""
+    if not BILLING_ENABLED:
+        return filename
+    user = await _user_from_request(request)
+    if user is None or user.plan != "free":
+        return filename
+    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    # Only jobs the pipeline rendered under this scheme (marker file). A job
+    # from before it has the mark burned into its canonical, so every
+    # derivative already carries one and a copy would stack a second.
+    if not watermarked.job_is_marked(output_dir):
+        return filename
+    import main as _main
+    marked = await asyncio.get_event_loop().run_in_executor(
+        None, _main.mark_delivery, os.path.join(output_dir, filename))
+    return os.path.basename(marked)
+
+
+def _media_guard(path: str) -> bool:
+    """``/videos`` allowlist: deliverable types only (media_auth), and on a
+    job rendered for the free plan never the clean twin of a served clip.
+    The twins exist so an upgrade can re-point at them, not for stripping
+    ``wm_`` off a URL."""
+    if not media_auth.is_servable(path):
+        return False
+    job_id, _, filename = path.replace("\\", "/").strip("/").partition("/")
+    if not filename or not watermarked.is_clean_deliverable(filename):
+        return True
+    return not watermarked.job_is_marked(os.path.join(OUTPUT_DIR, job_id))
+
+
+def _unmark_local_job(job_id, clip_index, clean_filename):
+    """After an upgrade: point the working copy of a clip at its clean twin.
+
+    Called by cloud/videos.unmark_user_library for every clip it re-pointed
+    in R2, so a dashboard still open on the job polls clean URLs from the
+    in-memory result and a later restore/recovery reads them from the
+    metadata. The marked file and the marker go, so the /videos guard opens
+    the twins again."""
+    job_dir = os.path.join(OUTPUT_DIR, job_id)
+    url = f"/videos/{job_id}/{clean_filename}"
+    job = jobs.get(job_id)
+    mem_clips = ((job or {}).get('result') or {}).get('clips') or []
+    if clip_index < len(mem_clips):
+        mem_clips[clip_index]['video_url'] = url
+    ready = (job or {}).get('ready_files')
+    if isinstance(ready, dict) and clip_index in ready:
+        ready[clip_index] = clean_filename
+    for meta_path in glob.glob(os.path.join(job_dir, "*_metadata.json")):
+        try:
+            with open(meta_path, 'r') as f:
+                data = json.load(f)
+            shorts = data.get('shorts', [])
+            if clip_index < len(shorts):
+                shorts[clip_index]['video_url'] = url
+                with open(meta_path, 'w') as f:
+                    json.dump(data, f, indent=4)
+        except Exception as e:
+            print(f"⚠️ Could not unmark metadata of {job_id}: {e}")
+    watermarked.unmark_job(job_dir)
+    marked_path = os.path.join(job_dir, watermarked.marked_name(clean_filename))
+    if os.path.exists(marked_path):
+        try:
+            os.remove(marked_path)
+        except OSError:
+            pass
 
 
 def _reapply_captions(job_id, clip_index, video_path):
@@ -626,6 +917,8 @@ def _recover_jobs_from_disk():
         job_path = os.path.join(OUTPUT_DIR, job_id)
         if not os.path.isdir(job_path) or job_id in jobs:
             continue
+        if os.path.isfile(os.path.join(job_path, _RESUME_FILE)):
+            continue  # in flight (interrupted or on the other instance): resume, not recover
         json_files = glob.glob(os.path.join(job_path, "*_metadata.json"))
         if not json_files:
             continue
@@ -647,7 +940,7 @@ def _recover_jobs_from_disk():
                 owner = int(raw) if raw.isdigit() else (raw or None)
             jobs[job_id] = {
                 'status': 'completed',
-                'logs': ["♻️ Job recovered from disk after server restart."],
+                'logs': _TimedLog(["♻️ Job recovered from disk after server restart."]),
                 'output_dir': job_path,
                 'user_id': owner,
                 'result': {'clips': clips, 'cost_analysis': data.get('cost_analysis')},
@@ -747,6 +1040,99 @@ def _manifest_busy_elsewhere(m, now=None):
     now = time.time() if now is None else now
     return (m.get("instance") not in (None, INSTANCE_ID)
             and now - float(m.get("heartbeat") or 0) < HEARTBEAT_STALE_AFTER)
+
+
+def _jobs_busy_elsewhere(now=None) -> int:
+    """How many jobs another instance is running right now (fresh heartbeat).
+
+    During a deploy the old container keeps running its jobs while it drains,
+    on the same GPU. Counting them is what stops the new container from
+    stacking its own full MAX_CONCURRENT_JOBS on top: 22-sep-2026, 7 old + 3
+    new jobs filled the 20 GB card and 5 of 12 jobs died of CUDA OOM.
+    """
+    now = time.time() if now is None else now
+    busy = 0
+    try:
+        entries = os.listdir(OUTPUT_DIR)
+    except FileNotFoundError:
+        return 0
+    for name in entries:
+        path = os.path.join(OUTPUT_DIR, name, _RESUME_FILE)
+        if not os.path.exists(path):
+            continue
+        m = _read_manifest(name)
+        if m and _manifest_busy_elsewhere(m, now):
+            busy += 1
+    return busy
+
+
+SHARED_GPU_WAIT_SECONDS = 5
+SHARED_GPU_MAX_WAIT = DRAIN_TIMEOUT_SECONDS + 120
+# Free VRAM a new job needs before it starts. A job peaks at ~4-6 GB while it
+# transcribes; starting one on a nearly full card is what made NVENC and
+# TransNetV2 of the jobs already running fail with CUDA OOM. 0 disables.
+GPU_MIN_FREE_MB = int(os.environ.get("GPU_MIN_FREE_MB", "4500"))
+_gpu_free_cache = {"at": 0.0, "mb": None}
+
+
+def _gpu_free_mb():
+    """Free memory on GPU 0 in MiB, or None when there is no nvidia-smi (CPU
+    host, self-host without a GPU): then only the job count limits."""
+    now = time.monotonic()
+    if now - _gpu_free_cache["at"] < 2:
+        return _gpu_free_cache["mb"]
+    mb = None
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits",
+             "-i", "0"], capture_output=True, text=True, timeout=5)
+        if out.returncode == 0 and out.stdout.strip():
+            mb = int(float(out.stdout.strip().splitlines()[0]))
+    except Exception:
+        mb = None
+    _gpu_free_cache.update(at=now, mb=mb)
+    return mb
+
+
+def gpu_has_room(running_here: int, busy_elsewhere: int, free_mb) -> bool:
+    """Whether a new job may start now.
+
+    The job count covers both instances during a deploy handover. The free
+    VRAM check covers what the count cannot see: jobs differ by an order of
+    magnitude in memory. With nothing running anywhere the job always starts,
+    so a card held by something outside our control can never stall the queue.
+    """
+    total = running_here + busy_elsewhere
+    if total >= MAX_CONCURRENT_JOBS:
+        return False
+    if total == 0 or GPU_MIN_FREE_MB <= 0 or free_mb is None:
+        return True
+    return free_mb >= GPU_MIN_FREE_MB
+
+
+async def _wait_for_shared_gpu():
+    """Hold a new job until the GPU has room for it: this instance's jobs
+    plus the ones another instance is still draining must fit
+    MAX_CONCURRENT_JOBS, and the card must have GPU_MIN_FREE_MB free.
+    Bounded: a killed instance stops heartbeating within
+    HEARTBEAT_STALE_AFTER, a drain cannot outlive DRAIN_TIMEOUT_SECONDS, and
+    past SHARED_GPU_MAX_WAIT the job starts anyway rather than wait forever."""
+    waited = 0.0
+    logged = False
+    loop = asyncio.get_event_loop()
+    while waited < SHARED_GPU_MAX_WAIT:
+        elsewhere = _jobs_busy_elsewhere()
+        free_mb = await loop.run_in_executor(None, _gpu_free_mb)
+        if gpu_has_room(len(_running_jobs), elsewhere, free_mb):
+            return
+        if not logged:
+            print(f"⏳ Holding the next job: {len(_running_jobs)} running here, "
+                  f"{elsewhere} on a draining instance, "
+                  f"{free_mb if free_mb is not None else '?'} MiB GPU free "
+                  f"(needs {GPU_MIN_FREE_MB}).")
+            logged = True
+        await asyncio.sleep(SHARED_GPU_WAIT_SECONDS)
+        waited += SHARED_GPU_WAIT_SECONDS
 
 
 def _write_instance_marker():
@@ -856,7 +1242,8 @@ def _install_drain_signal_handler():
 
 
 def _write_resume_manifest(job_id, cmd, priority, user_id, reservation_id, watermark,
-                           webhook_url=None, webhook_secret=None, base_url=None):
+                           webhook_url=None, webhook_secret=None, base_url=None,
+                           partial=None, source_cap_minutes=None, skip_statics=False):
     try:
         path = os.path.join(OUTPUT_DIR, job_id, _RESUME_FILE)
         with open(path, "w") as f:
@@ -873,6 +1260,13 @@ def _write_resume_manifest(job_id, cmd, priority, user_id, reservation_id, water
                 "webhook_url": webhook_url,
                 "webhook_secret": webhook_secret,
                 "base_url": base_url,
+                # A resumed job downloads the source again, so the cut must
+                # travel with it: only these minutes were reserved.
+                "partial": partial,
+                # Same reason for the whole-video jobs' safety cap.
+                "source_cap_minutes": source_cap_minutes,
+                # The probe's "statics bot-checked for this video" verdict.
+                "skip_statics": bool(skip_statics),
             }, f)
     except Exception as e:
         print(f"⚠️ Could not write resume manifest for {job_id}: {e}")
@@ -916,10 +1310,9 @@ def _resume_interrupted_jobs() -> set:
         manifest_path = os.path.join(job_path, _RESUME_FILE)
         if not os.path.isfile(manifest_path):
             continue
-        if glob.glob(os.path.join(job_path, "*_metadata.json")):
-            # Finished after all — recovered as completed already.
-            _clear_resume_manifest(job_id)
-            continue
+        # A manifest outlives only an interrupted run (the job wrapper drops it
+        # at every terminal state), so a metadata file next to it means the job
+        # was stopped mid-render, not that it finished: resume it too.
         try:
             with open(manifest_path) as f:
                 m = json.load(f)
@@ -948,7 +1341,7 @@ def _resume_interrupted_jobs() -> set:
 
         # Rebuild env from scratch — the manifest holds no secrets. Managed
         # (cloud) jobs get the server key; self-host falls back to its env key.
-        env = os.environ.copy()
+        env = child_env()
         try:
             from cloud import proxy_ledger as _pl
             if BILLING_ENABLED and _pl.budget_exceeded_sync():
@@ -964,6 +1357,19 @@ def _resume_interrupted_jobs() -> set:
             env["WATERMARK"] = "1"
         else:
             env.pop("WATERMARK", None)
+        partial = m.get("partial")
+        if partial and partial.get("processed_minutes"):
+            env["MAX_SOURCE_MINUTES"] = str(partial["processed_minutes"])
+        else:
+            env.pop("MAX_SOURCE_MINUTES", None)
+        if m.get("source_cap_minutes"):
+            env["SOURCE_CAP_MINUTES"] = str(m["source_cap_minutes"])
+        else:
+            env.pop("SOURCE_CAP_MINUTES", None)
+        if m.get("skip_statics"):
+            env["DOWNLOAD_SKIP_STATICS"] = "1"
+        else:
+            env.pop("DOWNLOAD_SKIP_STATICS", None)
 
         m["attempts"] = attempts
         try:
@@ -974,13 +1380,14 @@ def _resume_interrupted_jobs() -> set:
 
         jobs[job_id] = {
             'status': 'queued',
-            'logs': [f"♻️ Resuming your video after a server update (attempt {attempts})."],
+            'logs': _TimedLog([f"♻️ Resuming your video after a server update (attempt {attempts})."]),
             'cmd': m.get("cmd"),
             'env': env,
             'output_dir': job_path,
             'user_id': None if user_id is None else user_id,
             'reservation_id': reservation_id,
             'watermark': bool(m.get("watermark")),
+            'partial': partial or None,
             'webhook_url': m.get("webhook_url"),
             'webhook_secret': m.get("webhook_secret"),
             'base_url': m.get("base_url"),
@@ -1003,6 +1410,70 @@ def _dir_size(path: str) -> int:
     return total
 
 
+# A job dir older than JOB_RETENTION_SECONDS can still be alive: on a busy day
+# a free job waits over an hour in the queue, and a long render runs past the
+# hour too. The sweeps used to delete those by age alone, under the worker's
+# feet: no clips, and the minute reservation stayed held until the 3 h stuck
+# sweep (22-sep-2026: 21 free jobs lost that way, most of them the user's
+# first). A manifest pins its dir for at most this long, so one nobody will
+# ever resume cannot keep a directory on disk forever.
+ACTIVE_JOB_MAX_SECONDS = int(os.environ.get("ACTIVE_JOB_MAX_SECONDS", str(24 * 3600)))
+
+
+def _job_is_active(job_id, now=None) -> bool:
+    """True while a job is queued or running here, or its resume manifest says
+    it has not reached a terminal state yet (the other instance's jobs during a
+    handover included). The disk sweeps must never touch such a job."""
+    if job_id in _running_jobs:
+        return True
+    if (jobs.get(job_id) or {}).get('status') in ('queued', 'processing'):
+        return True
+    try:
+        age = (time.time() if now is None else now) - os.path.getmtime(_manifest_path(job_id))
+    except OSError:
+        return False
+    return age <= ACTIVE_JOB_MAX_SECONDS
+
+
+def _upload_job_id(filename: str) -> str:
+    """Source uploads are stored as ``<job_id>_<name>``."""
+    return filename.split("_", 1)[0]
+
+
+def _sweep_expired_job_dirs(now):
+    """Drop job dirs older than JOB_RETENTION_SECONDS, except live jobs."""
+    for job_id in os.listdir(OUTPUT_DIR):
+        # Not a job: the thumbnails dir backs a StaticFiles mount, so
+        # deleting it would 500 every /thumbnails request until reboot.
+        if job_id == os.path.basename(THUMBNAILS_DIR):
+            continue
+        job_path = os.path.join(OUTPUT_DIR, job_id)
+        if not os.path.isdir(job_path):
+            continue
+        try:
+            expired = now - os.path.getmtime(job_path) > JOB_RETENTION_SECONDS
+        except OSError:
+            continue
+        if not expired or _job_is_active(job_id, now):
+            continue
+        print(f"🧹 Purging old job: {job_id}")
+        shutil.rmtree(job_path, ignore_errors=True)
+        jobs.pop(job_id, None)
+
+
+def _sweep_expired_uploads(now):
+    """Drop source uploads older than JOB_RETENTION_SECONDS, except the source
+    of a job that is still queued or running."""
+    for filename in os.listdir(UPLOAD_DIR):
+        file_path = os.path.join(UPLOAD_DIR, filename)
+        try:
+            if (now - os.path.getmtime(file_path) > JOB_RETENTION_SECONDS
+                    and not _job_is_active(_upload_job_id(filename), now)):
+                os.remove(file_path)
+        except Exception:
+            pass
+
+
 def _enforce_uploads_size_cap():
     """Delete the oldest source uploads while UPLOAD_DIR is over UPLOADS_MAX_GB.
 
@@ -1018,7 +1489,7 @@ def _enforce_uploads_size_cap():
     files = []
     for name in os.listdir(UPLOAD_DIR):
         p = os.path.join(UPLOAD_DIR, name)
-        if os.path.isfile(p):
+        if os.path.isfile(p) and not _job_is_active(_upload_job_id(name)):
             try:
                 files.append((os.path.getmtime(p), p, os.path.getsize(p)))
             except OSError:
@@ -1050,7 +1521,7 @@ def _enforce_output_size_cap():
         if job_id == thumbs:
             continue
         p = os.path.join(OUTPUT_DIR, job_id)
-        if os.path.isdir(p):
+        if os.path.isdir(p) and not _job_is_active(job_id):
             try:
                 candidates.append((os.path.getmtime(p), p, job_id))
             except OSError:
@@ -1108,18 +1579,7 @@ async def cleanup_jobs():
             
             # Simple directory cleanup based on modification time
             # Check OUTPUT_DIR
-            for job_id in os.listdir(OUTPUT_DIR):
-                # Not a job: the thumbnails dir backs a StaticFiles mount, so
-                # deleting it would 500 every /thumbnails request until reboot.
-                if job_id == os.path.basename(THUMBNAILS_DIR):
-                    continue
-                job_path = os.path.join(OUTPUT_DIR, job_id)
-                if os.path.isdir(job_path):
-                    if now - os.path.getmtime(job_path) > JOB_RETENTION_SECONDS:
-                        print(f"🧹 Purging old job: {job_id}")
-                        shutil.rmtree(job_path, ignore_errors=True)
-                        if job_id in jobs:
-                            del jobs[job_id]
+            _sweep_expired_job_dirs(now)
 
             for job_id in _sweep_retained_sources(now):
                 print(f"🧹 Dropped retained source for job {job_id}")
@@ -1152,12 +1612,7 @@ async def cleanup_jobs():
                 print(f"🧹 Expired agent upload slot {uid}")
 
             # Cleanup Uploads
-            for filename in os.listdir(UPLOAD_DIR):
-                file_path = os.path.join(UPLOAD_DIR, filename)
-                try:
-                    if now - os.path.getmtime(file_path) > JOB_RETENTION_SECONDS:
-                         os.remove(file_path)
-                except Exception: pass
+            _sweep_expired_uploads(now)
 
         except Exception as e:
             print(f"⚠️ Cleanup error: {e}")
@@ -1177,7 +1632,17 @@ async def process_queue():
                 continue
 
             # Acquire semaphore slot (waits if max jobs are running)
+            _admitting.add(job_id)
             await concurrency_semaphore.acquire()
+            if _draining:
+                _admitting.discard(job_id)
+                concurrency_semaphore.release()
+                job_queue.task_done()
+                print(f"⏸️ Draining — leaving {job_id} for the next instance.")
+                continue
+            # The old container may still be draining its jobs on this GPU.
+            await _wait_for_shared_gpu()
+            _admitting.discard(job_id)
             if _draining:
                 concurrency_semaphore.release()
                 job_queue.task_done()
@@ -1244,22 +1709,53 @@ async def _track_proxy_usage(job_id):
 
 async def run_job_wrapper(job_id):
     """Wrapper to run job and release semaphore"""
+    # Keep the record itself: run_job writes its status into this same dict,
+    # and if the entry is dropped from ``jobs`` mid-run the reservation must
+    # still be settled (released) instead of staying held for hours.
+    job = jobs.get(job_id)
+    interrupted = False
+    started = time.monotonic()
     try:
-        job = jobs.get(job_id)
         if job:
             await run_job(job_id, job)
+            if job.get('status') == 'completed':
+                _record_job_duration(time.monotonic() - started)
+    except asyncio.CancelledError:
+        # The server is shutting down (drain timeout of a deploy) and took this
+        # task with it. Not a failure: the manifest stays on disk and the next
+        # instance resumes the job (22-sep-2026: 6 jobs were marked failed and
+        # refunded at once this way instead).
+        interrupted = True
     except Exception as e:
          print(f"❌ Job wrapper error {job_id}: {e}")
     finally:
+        if interrupted or (_stopping and job and job.get('status') != 'completed'):
+            _running_jobs.discard(job_id)
+            concurrency_semaphore.release()
+            job_queue.task_done()
+            print(f"♻️ Server stopping: leaving {job_id} for the next instance.")
+            if interrupted:
+                raise asyncio.CancelledError()
+            return
+        if _should_auto_retry(job):
+            _schedule_auto_retry(job_id, job)
+            _running_jobs.discard(job_id)
+            concurrency_semaphore.release()
+            job_queue.task_done()
+            print(f"🔁 Released slot for job {job_id} (auto-retry scheduled).")
+            return
         # The subprocess returned (success or genuine failure) — a terminal
         # state, so drop the resume manifest. It only survives if the container
         # was killed mid-run, which is exactly when we want to resume.
         _clear_resume_manifest(job_id)
         # Settle the minute reservation (managed jobs only): commit on success,
         # release otherwise so the minutes go back to the user.
-        await _settle_reservation(job_id)
+        await _settle_reservation(job_id, job)
         # Archive the completed clips to the user's durable R2 library (history).
         await _archive_managed_job(job_id)
+        # Autopilot bookkeeping + autopublish (before the generic clips-ready
+        # email, which it replaces for its own jobs).
+        await _autopilot_job_finished(job_id, job)
         # Fire the caller's webhook (after archive, so durable links exist).
         await _notify_job_webhook(job_id)
         # Operational alerting for managed jobs (proxy out of credits / failures).
@@ -1275,6 +1771,79 @@ async def run_job_wrapper(job_id):
         concurrency_semaphore.release()
         job_queue.task_done()
         print(f"✅ Released slot for job: {job_id}")
+
+
+# --- Automatic retry of transient failures ----------------------------------
+# A job that dies of a condition on OUR side (a full GPU, an NVENC session
+# refused, a Gemini 5xx) is run once more by itself instead of showing the user
+# "failed". Content problems (no audio, private video, nothing clip-shaped,
+# policy block) fail as before: retrying cannot fix them.
+AUTO_RETRY_LIMIT = int(os.environ.get("AUTO_RETRY_LIMIT", "1"))
+AUTO_RETRY_DELAY_SECONDS = float(os.environ.get("AUTO_RETRY_DELAY_SECONDS", "30"))
+_TRANSIENT_MARKERS = (
+    "out of memory", "outofmemory", "cuda", "cublas", "cudnn", "nvenc",
+    "generic error in an external library", "exit code 187", "broken pipe",
+    "no clips could be rendered", "resource_exhausted", "resource exhausted",
+    "503", "502", "500 internal", "overloaded", "deadline exceeded",
+    "exit code -9", "exit code -15", "killed",
+)
+_PERMANENT_MARKERS = (
+    "no audio", "no_audio", "video unavailable", "private video", "members-only",
+    "prohibited_content", "blocked this video", "blocked its answer",
+    "did not return usable clips", "clip detection failed", "short-form content",
+    "sign in to confirm your age", "not available in your country",
+)
+
+
+def is_transient_failure(logs) -> bool:
+    """Whether a failed job's logs describe something a second run can fix."""
+    text = _job_error_text(list(logs or [])).lower()
+    if any(m in text for m in _PERMANENT_MARKERS):
+        return False
+    return any(m in text for m in _TRANSIENT_MARKERS)
+
+
+def _should_auto_retry(job) -> bool:
+    return bool(job and job.get('status') == 'failed' and not _draining
+                and int(job.get('auto_retries') or 0) < AUTO_RETRY_LIMIT
+                and job.get('cmd') and is_transient_failure(job.get('logs')))
+
+
+def _clean_for_retry(output_dir):
+    """Drop the half-made outputs of a failed run; keep the source, the
+    transcript checkpoint (the retry skips transcription), owner and manifest."""
+    try:
+        names = os.listdir(output_dir)
+    except OSError:
+        return
+    for name in names:
+        if ("_clip_" in name or name.endswith("_metadata.json")
+                or name.startswith(("temp_", "hooked_", "autosubs_"))):
+            try:
+                os.remove(os.path.join(output_dir, name))
+            except OSError:
+                pass
+
+
+def _schedule_auto_retry(job_id, job):
+    job['auto_retries'] = int(job.get('auto_retries') or 0) + 1
+    job['status'] = 'queued'
+    job['result'] = None
+    job['ready_files'] = {}
+    job['logs'].append("🔁 A temporary server problem interrupted your video. "
+                       "Retrying it automatically, no minutes are charged twice.")
+    _clean_for_retry(job.get('output_dir') or os.path.join(OUTPUT_DIR, job_id))
+    m = _read_manifest(job_id) or {}
+    priority = int(m.get("priority", 1))
+    print(f"🔁 Auto-retry {job['auto_retries']}/{AUTO_RETRY_LIMIT} for {job_id} "
+          f"in {AUTO_RETRY_DELAY_SECONDS:.0f}s.")
+
+    async def _later():
+        await asyncio.sleep(AUTO_RETRY_DELAY_SECONDS)
+        if job_id in jobs and jobs[job_id].get('status') == 'queued':
+            _enqueue_job(job_id, priority)
+
+    asyncio.create_task(_later())
 
 
 async def _archive_managed_job(job_id):
@@ -1311,6 +1880,18 @@ def _archive_clip_edit_bg(job_id: str, clip_index: int, filename: str):
             print(f"⚠️  R2 edit archive error for {job_id}: {e}")
 
     asyncio.create_task(_run())
+
+
+async def _autopilot_job_finished(job_id, job):
+    if not BILLING_ENABLED or not job or not job.get('user_id'):
+        return
+    try:
+        reason = None
+        if job.get('status') != 'completed':
+            reason = _alerts._classify_failure(_job_error_text(job.get('logs', [])))
+        await cloud.autopilot.on_job_finished(job_id, job, reason)
+    except Exception as e:
+        print(f"⚠️  Autopilot completion error for {job_id}: {e}")
 
 
 async def _notify_clips_ready(job_id):
@@ -1461,7 +2042,7 @@ async def _track_job_outcome(job, ok, err):
             job_index=job_index,
             clips=clips if ok else None,
             plan=job.get('user_plan'),
-            source="url" if job.get('url') else "upload",
+            source="url" if _job_source_url(job) else "upload",
             reason=(_alerts._classify_failure(err) if not ok and err else None),
         )
     except Exception as e:
@@ -1565,10 +2146,10 @@ async def _notify_job_webhook(job_id):
     asyncio.create_task(_deliver_webhook(url, body, job.get('webhook_secret')))
 
 
-async def _settle_reservation(job_id):
+async def _settle_reservation(job_id, job=None):
     if not BILLING_ENABLED:
         return
-    job = jobs.get(job_id) or {}
+    job = job if job is not None else (jobs.get(job_id) or {})
     reservation_id = job.get('reservation_id')
     if not reservation_id:
         return
@@ -1697,6 +2278,15 @@ async def lifespan(app: FastAPI):
         # Account erasure lives in cloud/, which can't import app.py; hand it the
         # one thing only this module can do — wipe the local working files.
         cloud.account.register_local_purge(_purge_local_jobs_for_user)
+        # Same arrangement for the watermark: when a user upgrades, cloud/videos
+        # re-points their clips at the clean twins in R2 and hands us each
+        # one so the working copy (and an open dashboard) follows.
+        cloud.videos.register_local_unmark(_unmark_local_job)
+        # Autopilot: watch connected YouTube channels for new videos. Paused
+        # while this instance drains so only the new container submits jobs.
+        cloud.autopilot.start(app, is_active=lambda: not _draining)
+        # Welcome / first-clip / win-back emails (cloud/lifecycle.py).
+        cloud.lifecycle.start(is_active=lambda: not _draining)
         # Nag on Telegram while the residential proxy is down/out of credits —
         # a single job-failure alert is easy to miss and ingest stays broken
         # until someone tops the balance up.
@@ -1714,6 +2304,11 @@ if BILLING_ENABLED:
 # cloud requires an osk_ API key, self-host keeps BYOK (see mcp_server.py).
 import mcp_server as _mcp_server
 app.include_router(_mcp_server.router)
+
+# Free public tools behind the /tools SEO pages: YouTube transcript (existing
+# captions only, never the GPU) and the title/description/tag generator.
+import free_tools as _free_tools
+app.include_router(_free_tools.router)
 
 # Enable CORS for frontend. Cloud mode locks this down to the configured origins;
 # self-host keeps the permissive wildcard it has always used.
@@ -1737,7 +2332,7 @@ from restoring_static import RestoringStaticFiles
 import media_auth
 app.mount("/videos", RestoringStaticFiles(
     directory=OUTPUT_DIR,
-    guard=media_auth.is_servable,
+    guard=_media_guard,
     restorer=lambda job_id: _restore_for_public_path(job_id)), name="videos")
 
 # Mount static files for serving thumbnails
@@ -1785,6 +2380,39 @@ _SENSITIVE_LOG_RE = re.compile(
     r'|\bcost\b|\$\s*[0-9]|scoring window|shortlist',
     re.IGNORECASE,
 )
+
+
+class _TimedLog(list):
+    """A job's log lines plus the time each one arrived (``.times``).
+
+    The dashboard used to stamp every line with the time it was RENDERED, so
+    all of them showed the same clock and it changed on every poll.
+    """
+
+    def __init__(self, lines=()):
+        super().__init__(lines)
+        self.times = [time.time()] * len(self)
+
+    def append(self, line):
+        super().append(line)
+        self.times.append(time.time())
+
+    def extend(self, lines):
+        lines = list(lines)
+        super().extend(lines)
+        self.times.extend([time.time()] * len(lines))
+
+
+def _visible_logs_timed(logs):
+    """(lines, times) to surface to the client; see _visible_logs."""
+    times = getattr(logs, "times", None)
+    if times is not None and len(times) != len(logs):
+        times = None
+    if not BILLING_ENABLED or DEBUG_LOGS:
+        return list(logs), list(times) if times is not None else None
+    from log_view import friendly_logs_timed
+    pairs = friendly_logs_timed(logs, times)
+    return [p[0] for p in pairs], ([p[1] for p in pairs] if times is not None else None)
 
 
 def _visible_logs(logs):
@@ -1878,7 +2506,16 @@ async def run_job(job_id, job_data):
         start_wait = time.time()
         last_heartbeat = time.time()
         while process.poll() is None:
-            await asyncio.sleep(2)
+            try:
+                await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                # Shutting down: stop the child so it cannot keep writing into
+                # the job dir while the next instance resumes the same job.
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+                raise
             if time.time() - last_heartbeat >= HEARTBEAT_EVERY:
                 _touch_manifest(job_id)
                 last_heartbeat = time.time()
@@ -2015,7 +2652,7 @@ async def _probe_youtube_quality(url: str) -> dict:
         try:
             proc = subprocess.run(
                 [sys.executable, QUALITY_PROBE_SCRIPT, "--url", url],
-                capture_output=True, timeout=75,
+                capture_output=True, timeout=75, env=child_env(),
             )
             return json.loads(proc.stdout.decode(errors="replace").strip() or "{}")
         except Exception as e:
@@ -2024,6 +2661,59 @@ async def _probe_youtube_quality(url: str) -> dict:
 
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _run)
+
+
+async def _validate_source_url(url: str):
+    """400 unless ``url`` is safe to hand to yt-dlp: http(s) on a globally
+    routable host (security_utils) and, on YouTube, one video rather than a
+    search / playlist / channel page (yt_clients). The download and the
+    metering probe check the same things again; this is the one in front of
+    the quality probe, which used to have none."""
+    from security_utils import assert_public_url, UnsafeURLError
+    from yt_clients import youtube_non_video_reason
+    try:
+        await asyncio.get_event_loop().run_in_executor(None, assert_public_url, url)
+    except UnsafeURLError as e:
+        raise HTTPException(status_code=400, detail=f"This URL can't be processed: {e}")
+    reason = youtube_non_video_reason(url)
+    if reason:
+        raise HTTPException(status_code=400, detail=(
+            f"This link is {reason}. Paste the link of one video "
+            "(youtube.com/watch?v=... or youtu.be/...)."))
+
+
+async def _quality_gate(url: str, force_low: bool):
+    """Run the pre-flight probe: raises 400 for a too-short source, returns
+    the needs_confirmation response for a low-resolution one, else None."""
+    probe = await _probe_youtube_quality(url)
+    # Hard reject, no confirm-and-retry: a too-short source fails the same
+    # way on every retry, so letting the user force it just burns the job.
+    source_duration = int(probe.get("duration") or 0)
+    if MIN_SOURCE_SECONDS > 0 and 0 < source_duration < MIN_SOURCE_SECONDS:
+        _reject_short_source(source_duration)
+    max_height = int(probe.get("max_height") or 0)
+    if not force_low and QUALITY_GATE_MIN_HEIGHT > 0 \
+            and 0 < max_height < QUALITY_GATE_MIN_HEIGHT:
+        print(f"⚠️ Quality gate: only {max_height}p available for {url} — asking user first.")
+        return JSONResponse({
+            "needs_confirmation": True,
+            "quality_check": {
+                "max_height": max_height,
+                "min_height": QUALITY_GATE_MIN_HEIGHT,
+                "cookies_invalid": bool(probe.get("cookies_invalid")),
+            },
+        })
+    return None
+
+
+async def _drop_unstarted_job(reservation_id, job_output_dir):
+    """Undo a submission refused after its minutes were reserved."""
+    if reservation_id:
+        try:
+            await _metering.release_reservation(reservation_id)
+        except Exception as e:
+            print(f"⚠️ Could not release reservation {reservation_id}: {e}")
+    shutil.rmtree(job_output_dir, ignore_errors=True)
 
 
 def _media_duration_seconds(path: str) -> float:
@@ -2245,6 +2935,7 @@ async def process_endpoint(
     thumbnail_session_id: Optional[str] = Form(None),
     captions: Optional[str] = Form(None),
     upload_id: Optional[str] = Form(None),
+    max_minutes: Optional[str] = Form(None),
 ):
     api_key = await resolve_gemini(request)
     if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
@@ -2282,6 +2973,7 @@ async def process_endpoint(
         thumbnail_session_id = body.get("thumbnail_session_id")
         captions = body.get("captions")
         upload_id = body.get("upload_id")
+        max_minutes = body.get("max_minutes")
 
     # Normalize output format (auto = keep pipeline default).
     if output_format not in ("vertical", "horizontal", "square"):
@@ -2330,30 +3022,11 @@ async def process_endpoint(
     if url and DISABLE_YOUTUBE_URL:
         raise HTTPException(status_code=403, detail="YouTube URL ingest is disabled on this deployment. Please upload a file you own.")
 
-    # Pre-flight quality gate: probe the offered resolution BEFORE starting, so
-    # the user can abort (refresh cookies / update yt-dlp) instead of burning
-    # 20 min on a 360p-only source. Fail-open: any probe error starts normally.
-    # The probe also runs under force_low_quality so the short-source check
-    # can't be bypassed through the quality-gate confirm.
-    if url and (QUALITY_GATE_MIN_HEIGHT > 0 or MIN_SOURCE_SECONDS > 0):
-        probe = await _probe_youtube_quality(url)
-        # Hard reject, no confirm-and-retry: a too-short source fails the same
-        # way on every retry, so letting the user force it just burns the job.
-        source_duration = int(probe.get("duration") or 0)
-        if MIN_SOURCE_SECONDS > 0 and 0 < source_duration < MIN_SOURCE_SECONDS:
-            _reject_short_source(source_duration)
-        max_height = int(probe.get("max_height") or 0)
-        if not force_low and QUALITY_GATE_MIN_HEIGHT > 0 \
-                and 0 < max_height < QUALITY_GATE_MIN_HEIGHT:
-            print(f"⚠️ Quality gate: only {max_height}p available for {url} — asking user first.")
-            return JSONResponse({
-                "needs_confirmation": True,
-                "quality_check": {
-                    "max_height": max_height,
-                    "min_height": QUALITY_GATE_MIN_HEIGHT,
-                    "cookies_invalid": bool(probe.get("cookies_invalid")),
-                },
-            })
+    # Refuse a URL no server-side fetch may touch before anything fetches it:
+    # the quality probe below used to run yt-dlp on it unvalidated (tailnet
+    # hosts included) and ahead of the balance / rate checks.
+    if url:
+        await _validate_source_url(url)
 
     # Capture attestation context for legal record (IP + timestamp + UA)
     client_ip = request.client.host if request.client else "unknown"
@@ -2380,7 +3053,7 @@ async def process_endpoint(
     # running this server. Every job then dies on `import cv2`. The quality
     # probe above already gets this right.
     cmd = [sys.executable, "-u", "main.py"] # -u for unbuffered
-    env = os.environ.copy()
+    env = child_env()
     if not paid_allowed:
         # Daily paid-proxy budget hit: this job runs on the free routes only.
         env.pop("PROXY_URL", None)
@@ -2557,7 +3230,46 @@ async def process_endpoint(
     print(f"[attestation] job={job_id} ip={attestation['ip']} source={attestation['source']} ack=true")
 
     # Meter + reserve minutes for managed users (no-op for BYOK / self-host).
-    user_id, priority, reservation_id, user_plan = await reserve_process_minutes(request, url, input_path, job_id)
+    user_id, priority, reservation_id, user_plan, partial = await reserve_process_minutes(
+        request, url, input_path, job_id, max_minutes=max_minutes)
+
+    # Pre-flight quality gate: probe the offered resolution BEFORE starting, so
+    # the user can abort (refresh cookies / update yt-dlp) instead of burning
+    # 20 min on a 360p-only source. Fail-open: any probe error starts normally.
+    # The probe also runs under force_low_quality so the short-source check
+    # can't be bypassed through the quality-gate confirm. It runs AFTER the
+    # metering step (entitlement, job limit, balance, the hourly probe cap), so
+    # an account with no minutes cannot use it as a free yt-dlp runner; a
+    # rejection hands the reservation back.
+    if url and (QUALITY_GATE_MIN_HEIGHT > 0 or MIN_SOURCE_SECONDS > 0):
+        try:
+            gate = await _quality_gate(url, force_low)
+        except BaseException:
+            await _drop_unstarted_job(reservation_id, job_output_dir)
+            raise
+        if gate is not None:
+            await _drop_unstarted_job(reservation_id, job_output_dir)
+            return gate
+
+    # A metered URL job never processes more than it paid for: the duration
+    # came from the metering probe, but the download is a second request and
+    # a server can answer it with a much longer file. main.py cuts anything
+    # clearly past the reserved minutes (partial jobs already carry a cut).
+    source_cap = getattr(request.state, "reserved_minutes", None)
+    if url and source_cap and not partial:
+        env["SOURCE_CAP_MINUTES"] = str(source_cap)
+    else:
+        env.pop("SOURCE_CAP_MINUTES", None)
+        source_cap = None
+    skip_statics = bool(url) and bool(getattr(request.state, "skip_statics", False))
+    if skip_statics:
+        env["DOWNLOAD_SKIP_STATICS"] = "1"
+    else:
+        env.pop("DOWNLOAD_SKIP_STATICS", None)
+    if partial:
+        # main.py cuts the source down to this many minutes before anything
+        # reads it, so the whole pipeline (and the editor) sees a short video.
+        env["MAX_SOURCE_MINUTES"] = str(partial["processed_minutes"])
     if user_plan == "free":
         # Free-plan clips carry a burned-in watermark (applied by the main.py
         # subprocess after each clip renders).
@@ -2571,7 +3283,7 @@ async def process_endpoint(
     # Enqueue Job
     jobs[job_id] = {
         'status': 'queued',
-        'logs': [f"Job {job_id} queued."],
+        'logs': _TimedLog([f"Job {job_id} queued."]),
         'cmd': cmd,
         'env': env,
         'output_dir': job_output_dir,
@@ -2579,9 +3291,12 @@ async def process_endpoint(
         'user_id': user_id,
         'reservation_id': reservation_id,
         'watermark': env.get("WATERMARK") == "1",
+        'partial': partial,
         'webhook_url': webhook_url,
         'webhook_secret': webhook_secret,
         'base_url': api_base,
+        # Read by the ClipsDelivered/JobFailed analytics event (plan).
+        'user_plan': user_plan,
     }
 
     # Persist the owner so recovered jobs keep their multi-tenant guard after a
@@ -2599,11 +3314,13 @@ async def process_endpoint(
     _write_resume_manifest(job_id, cmd, priority, user_id, reservation_id,
                            watermark=jobs[job_id]['watermark'],
                            webhook_url=webhook_url, webhook_secret=webhook_secret,
-                           base_url=api_base)
+                           base_url=api_base, partial=partial,
+                           source_cap_minutes=source_cap, skip_statics=skip_statics)
 
     _enqueue_job(job_id, priority)
 
-    return {"job_id": job_id, "status": "queued"}
+    return {"job_id": job_id, "status": "queued", "partial": partial,
+            "first_video": bool(getattr(request.state, "first_video", False))}
 
 def _job_view_from_disk(job_id):
     """What the disk says about a job this instance does not hold in memory.
@@ -2616,17 +3333,17 @@ def _job_view_from_disk(job_id):
     job_path = os.path.join(OUTPUT_DIR, job_id)
     if not os.path.isdir(job_path):
         return None
-    if glob.glob(os.path.join(job_path, "*_metadata.json")):
-        _recover_jobs_from_disk()
-        return jobs.get(job_id)
     m = _read_manifest(job_id)
     if m is None:
+        if glob.glob(os.path.join(job_path, "*_metadata.json")):
+            _recover_jobs_from_disk()
+            return jobs.get(job_id)
         return None
     alive = time.time() - float(m.get("heartbeat") or 0) < HEARTBEAT_STALE_AFTER
     owner = m.get("user_id")
     return {
         'status': 'processing' if alive else 'queued',
-        'logs': ["♻️ The server was updated; your video continues on the new instance."],
+        'logs': _TimedLog(["♻️ The server was updated; your video continues on the new instance."]),
         'user_id': (int(owner) if isinstance(owner, str) and owner.isdigit() else owner),
         'result': None,
     }
@@ -2651,10 +3368,18 @@ async def get_status(job_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Job not found")
 
     await _assert_job_owner(request, job)
+    _logs_view = _visible_logs_timed(job['logs'])
     return {
         "status": _presented_status(job_id, job),
-        "logs": _visible_logs(job['logs']),
-        "result": job.get('result')
+        "logs": _logs_view[0],
+        # When each line arrived (epoch seconds, parallel to "logs"), or None.
+        "log_times": _logs_view[1],
+        "result": job.get('result'),
+        # Position in line and a rough wait while the job is still queued.
+        "queue": queue_snapshot(job_id),
+        # Set when only the first part of the source was clipped (quota wall
+        # offer), so the dashboard can say so next to the clips.
+        "partial": job.get('partial'),
     }
 
 
@@ -2946,9 +3671,12 @@ async def _restore_job_files(job_id: str, proj, user_id: str) -> bool:
                 clip['video_url'] = (
                     f"/videos/{job_id}/"
                     f"{_canonical_clip_file(job_dir, base_name, i)}")
+        if any(watermarked.is_marked(c.get("server_file") or "")
+               for c in (proj.state or {}).get("clips", [])):
+            watermarked.mark_job(job_dir)
         jobs[job_id] = {
             'status': 'completed',
-            'logs': ["♻️ Project restored from your library."],
+            'logs': _TimedLog(["♻️ Project restored from your library."]),
             'output_dir': job_dir,
             'user_id': user_id,
             'result': {'clips': clips, 'cost_analysis': data.get('cost_analysis')},
@@ -3014,7 +3742,7 @@ async def _ensure_job_files(job_id: str, request: Request) -> bool:
 
 
 from editor import VideoEditor
-from subtitles import generate_srt, generate_ass, burn_subtitles, generate_srt_from_video
+from subtitles import generate_srt, generate_ass, burn_subtitles, generate_srt_from_video, CAPTION_PRESETS
 from hooks import add_hook_to_video
 from translate import translate_video, get_supported_languages
 from thumbnail import (analyze_video_for_titles, refine_titles, generate_thumbnail,
@@ -3161,6 +3889,7 @@ async def edit_clip(
             if recap:
                 edited_filename = os.path.basename(recap)
 
+        edited_filename = await _deliver(request, req.job_id, edited_filename)
         new_video_url = f"/videos/{req.job_id}/{edited_filename}"
 
         # Persist the new current file like /api/subtitle does: in-memory job
@@ -3221,6 +3950,15 @@ class SubtitleRequest(BaseModel):
     effect: str = "none"  # none | glow | pop | box (karaoke only)
     base_opacity: float = 1.0  # opacity of non-active words (dimmed modern look)
     uppercase: bool = False
+    reveal: bool = False  # karaoke: words appear as they are spoken
+    shadow: int = 0  # karaoke: drop shadow depth, 0-6
+    # Words per line, as a character budget (1 = one word at a time). None
+    # keeps the generator's defaults, which is what old clients send.
+    max_chars: Optional[int] = None
+    max_duration: Optional[float] = None
+    # Named look (subtitles.CAPTION_PRESETS); any field sent explicitly
+    # alongside it overrides that field of the preset.
+    preset: Optional[str] = None
     input_filename: Optional[str] = None
     # User-edited caption words. When present, the burn uses them VERBATIM
     # instead of regenerating from the stored transcript — without this, text
@@ -3379,7 +4117,8 @@ async def get_clip_edl(job_id: str, clip_index: int, request: Request):
         "canonical_range": canonical_range,
         "duration": total,
         "current_file": current_file,
-        "has_captions": bool(re.match(r'^subtitled_\d+_', current_file)),
+        "has_captions": bool(re.match(r'^subtitled_\d+_',
+                                      watermarked.clean_name(current_file))),
         "words": words_out,
         "source": {
             "available": bool(source_path),
@@ -3542,13 +4281,13 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
             input_path=source_path, segments=segments,
             output_dir=output_dir, clean_name=clean_name,
             reframe=True, output_format=data.get('output_format', 'auto'),
-            watermark=bool(job.get('watermark')),
             force_strategy=force_strategy,
             captions_transcript=v_transcript)
 
     try:
         loop = asyncio.get_event_loop()
         served_name, _clean_recut_name = await loop.run_in_executor(None, run_recut)
+        served_name = await _deliver(request, req.job_id, served_name)
 
         new_video_url = f"/videos/{req.job_id}/{served_name}"
         new_recipe = {"v": 1, "segments": segments,
@@ -3902,7 +4641,6 @@ async def _reframe_locked(req: ReframeRequest, request: Request, job, overrides)
             input_path=source_path, segments=segments,
             output_dir=output_dir, clean_name=clean_name,
             reframe=True, output_format=data.get('output_format', 'auto'),
-            watermark=bool(job.get('watermark')),
             force_strategy=force_strategy,
             crop_overrides=overrides,
             captions_transcript=v_transcript)
@@ -3910,6 +4648,7 @@ async def _reframe_locked(req: ReframeRequest, request: Request, job, overrides)
     try:
         loop = asyncio.get_event_loop()
         served_name, _clean = await loop.run_in_executor(None, run)
+        served_name = await _deliver(request, req.job_id, served_name)
 
         new_video_url = f"/videos/{req.job_id}/{served_name}"
         new_recipe = {"v": 1, "segments": segments,
@@ -3953,6 +4692,8 @@ async def _reframe_locked(req: ReframeRequest, request: Request, job, overrides)
 
 # --- Remotion Render Proxy ---
 RENDER_SERVICE_URL = os.getenv("RENDER_SERVICE_URL", "http://renderer:3100")
+# render id -> owner user id (None for self-host / BYOK), for the status poll.
+_render_owners: Dict[str, Optional[str]] = {}
 
 @app.post("/api/render")
 async def proxy_render(request: Request):
@@ -3967,6 +4708,8 @@ async def proxy_render(request: Request):
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(f"{RENDER_SERVICE_URL}/render", json=body)
         result = resp.json()
+        if isinstance(result, dict) and result.get("renderId"):
+            _render_owners[str(result["renderId"])] = await _owner_id(request)
         if reservation_id:
             await _metering.commit_reservation(reservation_id)
         return result
@@ -3976,9 +4719,19 @@ async def proxy_render(request: Request):
         raise HTTPException(status_code=502, detail=f"Render service unavailable: {e}")
 
 @app.get("/api/render/{render_id}")
-async def proxy_render_status(render_id: str):
+async def proxy_render_status(render_id: str, request: Request):
     """Proxy render status polling to the Node.js Remotion render service."""
     import httpx
+    # The id goes into the upstream path: ids are uuids, nothing else passes.
+    if not re.fullmatch(r"[A-Za-z0-9-]{1,64}", render_id or ""):
+        raise HTTPException(status_code=404, detail="Not found")
+    if BILLING_ENABLED:
+        # Only the account that started the render may poll it (and read its
+        # output URL). An id this instance never issued is refused rather than
+        # passed through.
+        if render_id not in _render_owners:
+            raise HTTPException(status_code=404, detail="Not found")
+        await _assert_job_owner(request, {"user_id": _render_owners[render_id]})
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(f"{RENDER_SERVICE_URL}/render/{render_id}")
@@ -4111,6 +4864,14 @@ async def generate_effects_config(
 
 @app.post("/api/subtitle")
 async def add_subtitles(req: SubtitleRequest, request: Request):
+    if req.preset:
+        preset = CAPTION_PRESETS.get(req.preset.strip().lower())
+        if preset is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown preset. Use one of: {', '.join(CAPTION_PRESETS)}.")
+        req = req.model_copy(update={k: v for k, v in preset.items()
+                                     if k not in req.model_fields_set})
     await require_managed_entitlement(request)
     await _ensure_job_files(req.job_id, request)
     if req.job_id not in jobs:
@@ -4217,7 +4978,12 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
         border_width=req.border_width, highlight_color=req.highlight_color,
         bg_color=req.bg_color, bg_opacity=req.bg_opacity,
         effect=req.effect, base_opacity=req.base_opacity, uppercase=req.uppercase,
+        reveal=req.reveal, shadow=req.shadow,
     )
+    if req.max_chars is not None:
+        karaoke_opts["max_chars"] = max(1, min(40, int(req.max_chars)))
+    if req.max_duration is not None:
+        karaoke_opts["max_duration"] = max(0.5, min(5.0, float(req.max_duration)))
 
     # Output video
     # We create a new file "subtitled_..."
@@ -4253,11 +5019,19 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
                 return generate_srt_from_video(input_path, srt_path)
 
             loop = asyncio.get_event_loop()
-            success = await loop.run_in_executor(None, run_transcribe_srt)
+            try:
+                success = await loop.run_in_executor(None, run_transcribe_srt)
+            finally:
+                # The ASR models must not stay resident in the API process:
+                # they held 7.7 GB of VRAM idle (transcribe_backends.release_models).
+                import transcribe_backends
+                await loop.run_in_executor(None, transcribe_backends.release_models)
         elif is_karaoke:
             success = generate_ass(sub_transcript, sub_start, sub_end, srt_path, **karaoke_opts)
         else:
-            success = generate_srt(sub_transcript, sub_start, sub_end, srt_path)
+            success = generate_srt(sub_transcript, sub_start, sub_end, srt_path,
+                                   karaoke_opts.get("max_chars", 20),
+                                   karaoke_opts.get("max_duration", 2.0))
 
         if not success:
              raise HTTPException(status_code=400, detail="No words found for this clip range.")
@@ -4282,6 +5056,8 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
 
     if reservation_id:
         await _metering.commit_reservation(reservation_id)
+
+    output_filename = await _deliver(request, req.job_id, output_filename)
 
     # 3. Update Result and Metadata
     # Update InMemory Jobs
@@ -4349,16 +5125,15 @@ async def remove_subtitles(req: RemoveSubtitlesRequest, request: Request):
            f"_clip_{req.clip_index + 1}.mp4")
 
     # Same walk-back the burn path uses, so this undoes any number of restyles.
-    while True:
-        m = re.match(r'^subtitled_\d+_(.+)$', filename)
-        if not m or not os.path.exists(os.path.join(output_dir, m.group(1))):
-            break
-        filename = m.group(1)
+    filename = _strip_burned_captions(output_dir, filename)
 
     if not os.path.exists(os.path.join(output_dir, filename)):
         raise HTTPException(status_code=404,
                             detail="The original clip is no longer available.")
 
+    # Free plan: the un-captioned file is served through its wm_ copy, which
+    # is reused when the clip shipped that way (no encode).
+    filename = await _deliver(request, req.job_id, filename)
     new_url = f"/videos/{req.job_id}/{filename}"
     if req.clip_index < len(job.get('result', {}).get('clips', [])):
         job['result']['clips'][req.clip_index]['video_url'] = new_url
@@ -4382,7 +5157,8 @@ class HookRequest(BaseModel):
     position: Optional[str] = "top" # top, center, bottom
     size: Optional[str] = "M" # S, M, L
     duration_seconds: Optional[float] = None  # None = hook visible for the whole clip
-    style: Optional[str] = "classic"  # classic/dark/yellow/red/outline/outline_yellow
+    style: Optional[str] = "pill"  # pill/classic/dark/yellow/red/outline/outline_yellow
+    font: Optional[str] = None  # montserrat/anton/serif (hooks.HOOK_FONTS); None = the style's own
     remove: Optional[bool] = False  # strip the burned hook instead of adding one
 
 @app.post("/api/hook")
@@ -4458,7 +5234,7 @@ async def add_hook(req: HookRequest, request: Request):
         try:
             # Run in thread pool
             def run_hook():
-                add_hook_to_video(input_path, req.text, output_path, position=req.position, font_scale=font_scale, duration=req.duration_seconds, style=req.style)
+                add_hook_to_video(input_path, req.text, output_path, position=req.position, font_scale=font_scale, duration=req.duration_seconds, style=req.style, font=req.font)
 
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, run_hook)
@@ -4479,13 +5255,15 @@ async def add_hook(req: HookRequest, request: Request):
         if recap:
             output_filename = os.path.basename(recap)
 
+    output_filename = await _deliver(request, req.job_id, output_filename)
+
     # Record the burned hook so the editor knows what the clip carries (the
     # auto-hook pipeline writes the same key).
     if req.remove:
         clip_data.pop('auto_hook', None)
     else:
         clip_data['auto_hook'] = {
-            "text": req.text, "style": req.style, "position": req.position,
+            "text": req.text, "style": req.style, "font": req.font, "position": req.position,
             "duration_seconds": req.duration_seconds,
         }
 
@@ -4604,6 +5382,8 @@ async def translate_clip(
     await loop.run_in_executor(
         None, lambda: mark_ai_generated(output_path, "AI voice dubbing"))
 
+    output_filename = await _deliver(request, req.job_id, output_filename)
+
     # Update InMemory Jobs
     if req.clip_index < len(job['result']['clips']):
          job['result']['clips'][req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
@@ -4639,6 +5419,16 @@ class SocialPostRequest(BaseModel):
     timezone: Optional[str] = "UTC"
 
 import httpx
+
+
+def _post_video_blocking(url, headers, data, file_path, filename, timeout):
+    """Multipart POST of a video to Upload-Post. Blocking: call it through
+    asyncio.to_thread from a request handler, never inline."""
+    with open(file_path, "rb") as f:
+        files = {"video": (filename, f.read(), "video/mp4")}
+    with httpx.Client(timeout=timeout) as client:
+        return client.post(url, headers=headers, data=data, files=files)
+
 
 @app.post("/api/social/post")
 async def post_to_socials(req: SocialPostRequest, request: Request):
@@ -4711,21 +5501,16 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
              data_payload["youtube_description"] = final_description
              data_payload["privacyStatus"] = "public"
 
-        # Send File
-        # httpx AsyncClient requires async file reading or bytes. 
-        # Since we have MAX_FILE_SIZE_MB, reading into memory is safe-ish.
-        with open(file_path, "rb") as f:
-            file_content = f.read()
-            
-        files = {
-            "video": (filename, file_content, "video/mp4")
-        }
+        # The upload is a blocking multipart POST of the whole clip (tens of
+        # seconds for TikTok+YouTube). Run inline, it froze the event loop:
+        # 23-sep-2026 19:47:48 UTC one post stalled every request, /health
+        # included, for 42 s and the uptime monitor paged "openshorts-api
+        # down". It runs in a worker thread so the API keeps answering.
+        print(f"📡 Sending to Upload-Post for platforms: {req.platforms}")
+        response = await asyncio.to_thread(
+            _post_video_blocking, url, headers, data_payload, file_path, filename, 120.0
+        )
 
-        # Switch to synchronous Client to avoid "sync request with AsyncClient" error with multipart/files
-        with httpx.Client(timeout=120.0) as client:
-            print(f"📡 Sending to Upload-Post for platforms: {req.platforms}")
-            response = client.post(url, headers=headers, data=data_payload, files=files)
-            
         if response.status_code not in [200, 201, 202]: # Added 201
              print(f"❌ Upload-Post Error: {response.text}")
              raise HTTPException(status_code=response.status_code, detail=f"Vendor API Error: {response.text}")
@@ -4759,7 +5544,10 @@ async def get_social_user(request: Request):
                 raise HTTPException(status_code=resp.status_code, detail=f"Failed to fetch user: {resp.text}")
             
             data = resp.json()
-            print(f"🔍 Upload-Post User Response: {data}")
+            # Never log the body: on the managed key it lists every profile
+            # on the account (usernames, redirect URLs), ~2 MB per call.
+            _n = len(data.get('profiles') or []) if isinstance(data, dict) else 0
+            print(f"🔍 Upload-Post users: {_n} profiles")
             
             user_id = None
             # The structure is {'success': True, 'profiles': [{'username': '...'}, ...]}
@@ -5073,7 +5861,13 @@ async def thumbnail_upload(
 
             from main import transcribe_video
             loop = asyncio.get_event_loop()
-            transcript = await loop.run_in_executor(None, transcribe_video, vpath)
+            try:
+                transcript = await loop.run_in_executor(None, transcribe_video, vpath)
+            finally:
+                # See transcribe_backends.release_models: the API process is
+                # long-lived and the GPU is shared with every running job.
+                import transcribe_backends
+                await loop.run_in_executor(None, transcribe_backends.release_models)
             segments = transcript.get("segments", [])
             duration = segments[-1]["end"] if segments else 0
 
@@ -5302,6 +6096,11 @@ async def thumbnail_generate(
                 "error": "plan_required",
                 "message": "AI thumbnail generation is available on paid plans.",
             })
+    # The session carries someone's transcript, titles and frames: only its
+    # owner may generate from it (and be billed for it).
+    _sess = thumbnail_sessions.get(session_id)
+    if _sess is not None:
+        await _assert_job_owner(request, _sess)
 
     # Clamp count
     count = min(max(1, count), 6)
@@ -5494,7 +6293,8 @@ async def thumbnail_publish(
 
     # Generate a unique ID for this publish job so the frontend can poll
     publish_id = str(uuid.uuid4())
-    publish_jobs[publish_id] = {"status": "uploading", "result": None, "error": None}
+    publish_jobs[publish_id] = {"status": "uploading", "result": None, "error": None,
+                                "user_id": session.get("user_id")}
 
     def do_upload():
         """Runs in a thread via BackgroundTasks — does the actual multipart upload."""
@@ -5545,11 +6345,13 @@ async def thumbnail_publish(
 
 
 @app.get("/api/thumbnail/publish/status/{publish_id}")
-async def thumbnail_publish_status(publish_id: str):
-    """Poll the status of a background publish job."""
+async def thumbnail_publish_status(publish_id: str, request: Request):
+    """Poll the status of a background publish job (owner only in cloud mode)."""
     if publish_id not in publish_jobs:
         raise HTTPException(status_code=404, detail="Publish job not found")
-    return publish_jobs[publish_id]
+    record = publish_jobs[publish_id]
+    await _assert_job_owner(request, record)
+    return {k: v for k, v in record.items() if k != "user_id"}
 
 
 # @app.get("/api/gallery/clips")
@@ -5842,14 +6644,10 @@ async def saasshorts_post_to_socials(req: SaaSPostRequest, request: Request):
             data_payload["privacyStatus"] = "public"
 
         filename = os.path.basename(file_path)
-        with open(file_path, "rb") as f:
-            file_content = f.read()
-
-        files = {"video": (filename, file_content, "video/mp4")}
-
-        with httpx.Client(timeout=120.0) as client:
-            print(f"📡 [AI Shorts] Sending to Upload-Post: {req.platforms}")
-            response = client.post(url, headers=headers, data=data_payload, files=files)
+        print(f"📡 [AI Shorts] Sending to Upload-Post: {req.platforms}")
+        response = await asyncio.to_thread(
+            _post_video_blocking, url, headers, data_payload, file_path, filename, 120.0
+        )
 
         if response.status_code not in [200, 201, 202]:
             raise HTTPException(status_code=response.status_code, detail=f"Upload-Post Error: {response.text}")
@@ -5863,6 +6661,33 @@ async def saasshorts_post_to_socials(req: SaaSPostRequest, request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# The gallery and the per-video pages are rendered by this API service, but the
+# app they advertise lives on www. A relative href on `api.` host resolves
+# against `api.`, where `/` is not the app (it is a 404), so every link that
+# crosses hosts is written absolute. `www.openshorts.app/gallery` and
+# `/video/...` 301 to the api host (dashboard/nginx.conf), so the api host is
+# the final domain for those two and the app host is final for everything else.
+APP_HOST = "https://www.openshorts.app"
+GALLERY_HOST = "https://api.openshorts.app"
+
+
+def _json_ld(payload: dict) -> str:
+    """Serialise a JSON-LD payload for an inline <script> block.
+
+    `html.escape()` is the wrong tool here: inside JSON-LD it produces
+    `&amp;quot;` and friends, which is still valid JSON *text* but no longer
+    means what it said, so the crawler reads a literal entity instead of a
+    quote. The right escaping for this context is JSON's own, plus `<>` and `&`
+    as unicode escapes so a title can never close the script tag.
+    """
+    return (
+        json.dumps(payload, ensure_ascii=False)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
+
+
 @app.get("/gallery", response_class=HTMLResponse)
 async def gallery_html_page():
     """SEO gallery page with all generated UGC videos."""
@@ -5873,10 +6698,14 @@ async def gallery_html_page():
     cards_html = ""
     ld_items = []
     for i, v in enumerate(videos):
-        title = html_mod.escape(v.get("title", "Untitled"))
-        video_url = v.get("video_url", "")
-        actor_url = v.get("actor_url", "")
-        video_id = v.get("video_id", "")
+        # Two versions of the same string on purpose: the HTML one is escaped
+        # for markup, the JSON-LD one is serialised as JSON. Escaping once and
+        # reusing the result in both places is what produced `&amp;amp;`.
+        raw_title = v.get("title", "Untitled")
+        title = html_mod.escape(raw_title)
+        video_url = html_mod.escape(_http_url_or_empty(v.get("video_url", "")))
+        actor_url = html_mod.escape(_http_url_or_empty(v.get("actor_url", "")))
+        video_id = html_mod.escape(str(v.get("video_id", "")))
         duration = v.get("duration", 0)
         mode = v.get("video_mode", "")
         product = html_mod.escape(v.get("product_name", ""))
@@ -5900,9 +6729,29 @@ async def gallery_html_page():
           </div>
         </a>'''
 
-        ld_items.append(f'{{"@type":"ListItem","position":{i+1},"url":"https://openshorts.app/video/{video_id}","name":"{title}"}}')
+        ld_items.append(
+            {
+                "@type": "ListItem",
+                "position": i + 1,
+                # The apex 301s to www, which 301s to here: name the host the
+                # page is actually served from.
+                "url": f"{GALLERY_HOST}/video/{video_id}",
+                "name": raw_title,
+            }
+        )
 
-    ld_json = f'{{"@context":"https://schema.org","@type":"CollectionPage","name":"AI UGC Video Gallery","mainEntity":{{"@type":"ItemList","numberOfItems":{len(videos)},"itemListElement":[{",".join(ld_items)}]}}}}'
+    ld_json = _json_ld(
+        {
+            "@context": "https://schema.org",
+            "@type": "CollectionPage",
+            "name": "AI UGC Video Gallery",
+            "mainEntity": {
+                "@type": "ItemList",
+                "numberOfItems": len(videos),
+                "itemListElement": ld_items,
+            },
+        }
+    )
 
     return f'''<!DOCTYPE html>
 <html lang="en">
@@ -5911,6 +6760,7 @@ async def gallery_html_page():
 <title>AI UGC Video Gallery | OpenShorts</title>
 <meta name="description" content="Browse {len(videos)} AI-generated UGC marketing videos. Create viral TikTok and Instagram Reels for your SaaS product.">
 <meta name="robots" content="index, follow">
+<link rel="canonical" href="{GALLERY_HOST}/gallery">
 <meta property="og:title" content="AI UGC Video Gallery | OpenShorts">
 <meta property="og:type" content="website">
 <meta property="og:description" content="Browse AI-generated UGC marketing videos for SaaS products.">
@@ -5926,12 +6776,18 @@ h1{{font-size:28px;font-weight:700;padding:40px 20px 0;text-align:center}}
 </style>
 </head>
 <body>
-<nav><strong style="font-size:18px">OpenShorts</strong><a href="/" class="cta">Create Your Video</a></nav>
+<nav><strong style="font-size:18px">OpenShorts</strong><a href="{APP_HOST}/" class="cta">Create Your Video</a></nav>
 <h1>AI-Generated UGC Videos</h1>
 <p class="subtitle">{len(videos)} videos generated · Low Cost & Premium modes</p>
 <div class="grid">{cards_html}</div>
-<div style="text-align:center;padding:40px"><a href="/" class="cta">Create Your Own UGC Video</a></div>
+<div style="text-align:center;padding:40px"><a href="{APP_HOST}/" class="cta">Create Your Own UGC Video</a></div>
 </body></html>'''
+
+
+def _http_url_or_empty(value) -> str:
+    """``value`` if it is an http(s) URL, else "" (no javascript:/data:)."""
+    value = str(value or "").strip()
+    return value if re.match(r"(?i)^https?://", value) else ""
 
 
 @app.get("/video/{video_id}", response_class=HTMLResponse)
@@ -5944,22 +6800,46 @@ async def video_html_page(video_id: str):
     if not meta:
         raise HTTPException(status_code=404, detail="Video not found")
 
-    title = html_mod.escape(meta.get("title", "Untitled"))
-    caption = html_mod.escape(meta.get("caption", ""))
+    # Raw values feed the JSON-LD (serialised as JSON by _json_ld) while the
+    # escaped ones feed the markup; they are not interchangeable.
+    raw_title = meta.get("title", "Untitled")
+    raw_caption = meta.get("caption", "")
+    title = html_mod.escape(raw_title)
+    caption = html_mod.escape(raw_caption)
     narration = html_mod.escape(meta.get("full_narration", ""))
-    video_url = meta.get("video_url", "")
-    actor_url = meta.get("actor_url", "")
+    # Everything below lands in markup, generated from user input (product
+    # page scrape, Gemini output): escape it all, and only let http(s) URLs
+    # into src/href/content so a javascript: URL cannot ride along either.
+    raw_video_url = _http_url_or_empty(meta.get("video_url", ""))
+    raw_actor_url = _http_url_or_empty(meta.get("actor_url", ""))
+    video_url = html_mod.escape(raw_video_url)
+    actor_url = html_mod.escape(raw_actor_url)
     duration = meta.get("duration", 0)
     mode = meta.get("video_mode", "")
     product = html_mod.escape(meta.get("product_name", ""))
-    product_url = html_mod.escape(meta.get("product_url", ""))
-    language = meta.get("language", "en")
-    hashtags = " ".join(meta.get("hashtags", []))
+    product_url = html_mod.escape(_http_url_or_empty(meta.get("product_url", "")))
+    raw_language = str(meta.get("language", "en") or "en")
+    language = raw_language if re.fullmatch(r"[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})?", raw_language) else "en"
+    hashtags = html_mod.escape(" ".join(str(h) for h in (meta.get("hashtags") or [])))
     cost = meta.get("cost_estimate", {}).get("total", 0)
     created = meta.get("created_at", "")
     actor_desc = html_mod.escape(meta.get("actor_description", ""))
 
-    ld_json = f'{{"@context":"https://schema.org","@type":"VideoObject","name":"{title}","description":"{caption}","thumbnailUrl":"{actor_url}","contentUrl":"{video_url}","uploadDate":"{created}","duration":"PT{int(duration)}S","width":1080,"height":1920,"inLanguage":"{language}"}}'
+    ld_json = _json_ld(
+        {
+            "@context": "https://schema.org",
+            "@type": "VideoObject",
+            "name": raw_title,
+            "description": raw_caption,
+            "thumbnailUrl": raw_actor_url,
+            "contentUrl": raw_video_url,
+            "uploadDate": created,
+            "duration": f"PT{int(duration)}S",
+            "width": 1080,
+            "height": 1920,
+            "inLanguage": language,
+        }
+    )
 
     mode_label = "Low Cost" if mode == "lowcost" else "Premium"
 
@@ -5969,6 +6849,7 @@ async def video_html_page(video_id: str):
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title} - AI UGC Video | OpenShorts</title>
 <meta name="description" content="{caption} {hashtags}">
+<link rel="canonical" href="{GALLERY_HOST}/video/{video_id}">
 <meta property="og:type" content="video.other">
 <meta property="og:title" content="{title}">
 <meta property="og:description" content="{caption}">
@@ -5999,7 +6880,7 @@ h1{{font-size:22px;font-weight:700;margin-bottom:8px}}
 </style>
 </head>
 <body>
-<nav><strong>OpenShorts</strong><a href="/gallery">Gallery</a><span style="color:#3f3f46">›</span><span style="color:#e4e4e7;font-size:14px">{title}</span></nav>
+<nav><strong>OpenShorts</strong><a href="{GALLERY_HOST}/gallery">Gallery</a><span style="color:#3f3f46">›</span><span style="color:#e4e4e7;font-size:14px">{title}</span></nav>
 <div class="container">
 <div><video src="{video_url}" poster="{actor_url}" controls autoplay playsinline style="aspect-ratio:9/16;object-fit:cover"></video></div>
 <div>
@@ -6009,8 +6890,8 @@ h1{{font-size:22px;font-weight:700;margin-bottom:8px}}
 <div class="section"><h2>Script</h2><p>{narration}</p></div>
 <div class="section"><h2>Actor</h2><p>{actor_desc}</p></div>
 {f'<div class="section"><h2>Product</h2><p><a href="{product_url}" style="color:#8b5cf6" target="_blank">{product}</a></p></div>' if product_url else ''}
-<a href="/gallery">← Back to Gallery</a>
-<br><a href="/" class="cta">Create Your Own</a>
+<a href="{GALLERY_HOST}/gallery">← Back to Gallery</a>
+<br><a href="{APP_HOST}/" class="cta">Create Your Own</a>
 </div>
 </div>
 </body></html>'''
@@ -6081,7 +6962,7 @@ async def saasshorts_generate(
             saas_jobs[job_id] = {
                 "user_id": await _owner_id(request),
                 "status": "processing",
-                "logs": [f"Retrying job {job_id[:8]}... reusing cached assets from disk."],
+                "logs": _TimedLog([f"Retrying job {job_id[:8]}... reusing cached assets from disk."]),
                 "result": None,
                 "output_dir": job_output_dir,
             }
@@ -6093,7 +6974,7 @@ async def saasshorts_generate(
         saas_jobs[job_id] = {
             "user_id": await _owner_id(request),
             "status": "processing",
-            "logs": ["SaaSShorts job started."],
+            "logs": _TimedLog(["SaaSShorts job started."]),
             "result": None,
             "output_dir": job_output_dir,
         }
@@ -6105,16 +6986,22 @@ async def saasshorts_generate(
             # Download from S3 public URL to job output dir
             import httpx
             from security_utils import assert_public_url
-            try:
+            actor_local = os.path.join(job_output_dir, "selected_actor.png")
+
+            def _fetch_actor():
                 # SSRF guard: block private / metadata hosts before fetching.
                 safe_actor_url = assert_public_url(req.selected_actor_url)
-                actor_local = os.path.join(job_output_dir, "selected_actor.png")
                 with httpx.Client(timeout=30.0) as client:
                     resp = client.get(safe_actor_url)
-                    if resp.status_code == 200:
-                        with open(actor_local, "wb") as f:
-                            f.write(resp.content)
-                        selected_actor_path = actor_local
+                if resp.status_code != 200:
+                    return None
+                with open(actor_local, "wb") as f:
+                    f.write(resp.content)
+                return actor_local
+
+            try:
+                # Off the event loop: DNS check + a download of up to 30 s.
+                selected_actor_path = await asyncio.to_thread(_fetch_actor)
             except Exception:
                 pass
         else:

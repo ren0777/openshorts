@@ -20,6 +20,8 @@ them with margin.
 """
 import os
 
+from ffmpeg_utils import blurred_backdrop
+
 CORNER_MARGIN = 0.20   # a subject this far from an edge (as a fraction of the
                        # frame) still counts as anchored to it
 
@@ -281,8 +283,7 @@ def inset_filtergraph(orig_w, orig_h, out_w, out_h, box, camera_ratio=None):
         # Blurred backdrop so the leftover strip is not a black bar. Scaled by
         # HEIGHT: scaling a 16:9 source to 1080 wide gives 608 tall, and there
         # is no 1920-tall crop to take out of that.
-        f"[bga]scale=-2:{out_h},crop=w=min(iw\\,{out_w}):h={out_h},"
-        f"scale={out_w}:{out_h},gblur=sigma=14[bg];"
+        f"[bga]{blurred_backdrop(out_w, out_h, 14)}[bg];"
         f"[sa]scale={out_w}:{screen_h}[screen];"
         f"[ca]crop=w={w}:h={h}:x={x}:y={y},scale={out_w}:{cam_h}[cam];"
         f"[bg][screen]overlay=x=0:y={filler_h // 2}[withscreen];"

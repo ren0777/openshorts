@@ -146,3 +146,18 @@ class TestShadowMode:
         assert "[layout-shadow]" in out
         assert "decision=split" in out
         assert "would_enable=split_layout,active_speaker" in out
+
+
+def test_sample_frames_falls_back_to_ffmpeg_when_opencv_reads_nothing(tmp_path, monkeypatch):
+    """AV1 sources: OpenCV's bundled FFmpeg reads no frame, the CLI does."""
+    import numpy as np
+
+    src = tmp_path / "av1.mp4"
+    src.write_bytes(b"not a video OpenCV can open")
+    frame = np.full((360, 640, 3), 120, dtype=np.uint8)
+    monkeypatch.setattr(layout_picker, "_ffmpeg_frames", lambda path, n: [frame] * n)
+
+    out = layout_picker.sample_frames(str(src), n=3, width=320)
+
+    assert len(out) == 3
+    assert all(j[:2] == b"\xff\xd8" for j in out)  # JPEG

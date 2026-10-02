@@ -400,7 +400,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
         {/* Header */}
         <div className="flex items-end justify-between mb-2">
           <div>
-            <p className="eyebrow mb-2">02 · AI SHORTS</p>
+            <p className="eyebrow mb-2">03 · AI SHORTS</p>
             <h1 className="font-display lowercase text-2xl text-ink">AI Shorts</h1>
           </div>
           {step > 0 && (

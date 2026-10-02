@@ -45,6 +45,17 @@ def download_file(key, local_path):
     client().download_file(settings.r2_bucket, key, local_path)
 
 
+def object_size(key):
+    """Size in bytes of one object, or None when it is not there."""
+    try:
+        return int(client().head_object(Bucket=settings.r2_bucket, Key=key)["ContentLength"])
+    except client().exceptions.ClientError as e:
+        code = str((e.response or {}).get("Error", {}).get("Code", ""))
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return None
+        raise
+
+
 def delete_key(key):
     client().delete_object(Bucket=settings.r2_bucket, Key=key)
 

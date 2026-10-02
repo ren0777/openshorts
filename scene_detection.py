@@ -108,6 +108,12 @@ def _detect_transnetv2(video_path):
     with _TN2_LOCK, torch.no_grad():
         tensor = torch.from_numpy(np.ascontiguousarray(frames)).to(model.device)
         single_frame_pred, _ = model.predict_frames(tensor, quiet=True)
+        single_frame_pred = single_frame_pred.cpu()
+        del tensor
+        # torch's caching allocator keeps the peak of this pass reserved for
+        # the rest of the process; eight jobs doing that filled a 20 GB card.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # predictions_to_scenes returns [[start, end], ...] with INCLUSIVE ends;
     # downstream expects PySceneDetect's exclusive ends.

@@ -28,8 +28,8 @@ import screencast_layout
 import hardsubs
 import layout_ranges
 import split_layout
-from ffmpeg_utils import (video_encode_args, escape_filter_value, QUALITY_FAST,
-                          METADATA_SCRUB)
+from ffmpeg_utils import (video_encode_args, blurred_backdrop, escape_filter_value,
+                          QUALITY_FAST, METADATA_SCRUB)
 
 ANALYSIS_MAX_WIDTH = 640
 
@@ -167,8 +167,7 @@ def general_filtergraph(out_w, out_h, content_h=None, orig_w=None, orig_h=None,
             if bg_trim_bottom > 0 else "")
     return (
         f"[0:v]split=2[bga][fga];"
-        f"[bga]{trim}scale=-2:{out_h},crop=w=min(iw\\,{out_w}):h={out_h},"
-        f"scale={out_w}:{out_h},gblur=sigma={bg_sigma}[bg];"
+        f"[bga]{trim}{blurred_backdrop(out_w, out_h, bg_sigma)}[bg];"
         # Scale by HEIGHT, then trim any overflow to the output width. crop
         # centres by default, and min() makes it a no-op when the scaled source
         # is already narrower than the frame (portrait/square sources).
@@ -352,7 +351,7 @@ def _run(cmd):
 
 
 def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
-           force_strategy=None, crop_overrides=None):
+           force_strategy=None, crop_overrides=None, watermark=False):
     """Full v2 reframe of one clip. Raises on failure (caller falls back).
 
     ``content_ranges`` comes from screencast_layout.detect_content_ranges() on
@@ -368,6 +367,10 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
     listed keep the automatic camera, so correcting one bad shot never disturbs
     the ones the tracker got right. Applied AFTER force_strategy: a per-scene
     hand position always beats the whole-clip choice for the scenes it names.
+
+    ``watermark`` overlays the free-plan mark (main.watermark_filter) in every
+    segment's own encode, instead of main.apply_watermark re-encoding the
+    finished clip once more.
     """
     import main as m
     content_ranges = content_ranges or []
@@ -541,6 +544,11 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
     ranges = scene_frame_ranges(scene_boundaries, strategies, len(xs))
     if not ranges:
         raise RuntimeError("no usable scene ranges")
+    logo = m.watermark_logo_path() if watermark else None
+    if logo and not os.path.exists(logo):
+        print(f"   ⚠️ Watermark asset missing ({logo}); clip kept unmarked.")
+        logo = None
+
     workdir = tempfile.mkdtemp(prefix="reframe_v2_")
     segments = []
     try:
@@ -597,10 +605,15 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
                     f"scale={out_w}:{out_h},setsar=1[v]"
                 )
 
+            inputs, out_label = ["-i", input_video], "[v]"
+            if logo:
+                inputs += ["-i", logo]
+                graph += ";" + m.watermark_filter(out_w, out_h, video="[v]", out="[vw]")
+                out_label = "[vw]"
             _run([
                 "ffmpeg", "-y", "-loglevel", "error",
-                "-ss", f"{ss:.4f}", "-t", f"{dur:.4f}", "-i", input_video,
-                "-filter_complex", graph, "-map", "[v]",
+                "-ss", f"{ss:.4f}", "-t", f"{dur:.4f}", *inputs,
+                "-filter_complex", graph, "-map", out_label,
                 *video_encode_args(QUALITY_FAST), "-an", seg_path,
             ])
             segments.append(seg_path)

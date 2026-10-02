@@ -21,8 +21,13 @@ class TestTheGuardIsWiredIn:
         app = pytest.importorskip("app")
         mount = next(r for r in app.app.routes
                      if getattr(r, "name", None) == "videos")
-        assert mount.app.guard is media_auth.is_servable, \
+        # app._media_guard wraps the allowlist (and adds the free-plan rule
+        # that refuses a marked job's clean twins, tests/test_watermark_delivery).
+        assert mount.app.guard is app._media_guard, \
             "/videos is serving the working directory with no allowlist"
+        assert not app._media_guard("job/.resume.json")
+        assert not app._media_guard("job/x_metadata.json")
+        assert app._media_guard("job/x_clip_1.mp4")
 
 
 class TestWhatMayLeave:

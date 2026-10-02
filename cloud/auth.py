@@ -214,10 +214,33 @@ async def request_magic_link(payload: MagicLinkRequest, request: Request):
         if verdict == email_policy.MX_NONE:
             raise HTTPException(status_code=400, detail=(
                 "That email domain can't receive mail. Please double-check the address."))
+    else:
+        # The account keeps signing in, but eligibility for the free minutes
+        # is re-checked: a temp-mail front whose MX joined disposable_mx.txt
+        # after the account was made would otherwise keep its free plan
+        # forever (568 such accounts in sep-2026).
+        await _deny_free_if_disposable_mx(email)
 
     link = f"{settings.frontend_url}/#/auth/verify?ml={raw_token}"
     await send_magic_link_email(email, link)
     return {"ok": True}
+
+
+async def _deny_free_if_disposable_mx(email: str):
+    """Mark an existing account's free plan withdrawn when its mail domain's
+    MX is a known temp-mail host. Best effort: never blocks the sign-in."""
+    try:
+        if await email_policy.mx_verdict(email) != email_policy.MX_DISPOSABLE:
+            return
+        from sqlalchemy import update
+        async with database.session() as session:
+            async with session.begin():
+                await session.execute(
+                    update(User)
+                    .where(User.email == email, User.free_plan_denied.is_(None))
+                    .values(free_plan_denied="disposable_mx"))
+    except Exception as e:
+        print(f"⚠️ free-plan MX re-check failed: {e}")
 
 
 async def purge_stale_magic_tokens():
@@ -253,7 +276,9 @@ async def verify_magic_link(payload: MagicVerifyRequest):
                 select(User).where(User.email == email)
             )).scalar_one_or_none()
             if user is None:
-                user = User(email=email, last_login_at=_now())
+                from .account import free_plan_denial_for_signup
+                user = User(email=email, last_login_at=_now(),
+                            free_plan_denied=await free_plan_denial_for_signup(session, email))
                 session.add(user)
                 await session.flush()
             else:
@@ -339,6 +364,8 @@ async def get_me(request: Request):
     async with database.session() as session:
         bal = await metering._balance(session, user.id)
         sub = bal["_sub"]
+        from .onboarding import is_pending as _survey_pending
+        survey_pending = await _survey_pending(session, user)
     # Report the entitling subscription when there is one; otherwise fall back to
     # a row that needs the customer's attention (card declined, payment never
     # finished). Without this a past_due customer sees a plain free account and
@@ -367,4 +394,5 @@ async def get_me(request: Request):
             "remaining": bal["remaining"],
         },
         "upload_post_profile": user.upload_post_profile,
+        "onboarding_survey_pending": survey_pending,
     }

@@ -29,6 +29,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 
 import mcp_ui
+from subtitles import CAPTION_PRESETS, line_budget
 
 router = APIRouter()
 
@@ -221,20 +222,38 @@ TOOLS = [
         "name": "add_subtitles",
         "title": "Burn styled captions onto a clip",
         "description": (
-            "Re-style the captions of one clip (clips already ship with default "
-            "captions). style 'karaoke' highlights the active word."
+            "Re-style the captions of one clip (clips already ship with the "
+            "'default' preset). Easiest: pass a preset; any other field you send "
+            "overrides that part of it. Without a preset, style 'karaoke' "
+            "highlights the active word."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "job_id": {"type": "string"},
                 "clip_index": {"type": "integer", "description": "0-based index from list_clips."},
+                "preset": {"type": "string", "enum": list(CAPTION_PRESETS),
+                           "description": (
+                               "default: Anton caps, yellow active word. "
+                               "hormozi: words appear as spoken, yellow active word. "
+                               "pill: purple box behind the active word. "
+                               "lime: lime box behind the active word. "
+                               "oneword: one big word at a time. "
+                               "clean: no outline, soft shadow, sentence case.")},
                 "style": {"type": "string", "enum": ["classic", "karaoke"]},
                 "position": {"type": "string", "enum": ["top", "middle", "bottom"]},
-                "font_size": {"type": "integer"},
-                "font_name": {"type": "string"},
+                "font_size": {"type": "integer",
+                              "description": "44 is the default (M); 34 = S, 56 = L, 70 = XL."},
+                "font_name": {"type": "string",
+                              "description": "Anton, Montserrat ExtraBold, Verdana, Arial, Impact, Georgia..."},
                 "font_color": {"type": "string", "description": "Hex color, e.g. #FFFFFF."},
-                "highlight_color": {"type": "string", "description": "Karaoke active-word color."},
+                "highlight_color": {"type": "string", "description": "Karaoke active-word color (or box color with effect 'highlight')."},
+                "effect": {"type": "string", "enum": ["none", "pop", "glow", "box", "highlight"],
+                           "description": "Karaoke active-word effect; 'highlight' = solid box behind it."},
+                "reveal": {"type": "boolean", "description": "Karaoke: words appear as they are spoken."},
+                "one_word": {"type": "boolean", "description": "Show one word at a time."},
+                "shadow": {"type": "integer", "description": "Drop shadow depth 0-6."},
+                "border_width": {"type": "integer", "description": "Outline 0-10 (0 needs a shadow to stay readable)."},
                 "uppercase": {"type": "boolean"},
             },
             "required": ["job_id", "clip_index"],
@@ -446,10 +465,21 @@ async def _tool_get_quota(client, args):
 
 async def _tool_add_subtitles(client, args):
     body = {"job_id": args["job_id"], "clip_index": args["clip_index"]}
-    for k in ("style", "position", "font_size", "font_name", "font_color",
-              "highlight_color", "uppercase"):
+    for k in ("preset", "style", "position", "font_size", "font_name", "font_color",
+              "highlight_color", "effect", "reveal", "shadow", "border_width",
+              "uppercase"):
         if args.get(k) is not None:
             body[k] = args[k]
+    if args.get("one_word"):
+        body["max_chars"] = 1
+    elif ("font_size" in body or "font_name" in body) and \
+            CAPTION_PRESETS.get(str(body.get("preset") or "").lower(), {}).get("max_chars") != 1:
+        # A resized or refonted line gets the budget that keeps it on one
+        # line, as the dashboard does; the preset's font fills the gap.
+        base = CAPTION_PRESETS.get(str(body.get("preset") or "default").lower(),
+                                   CAPTION_PRESETS["default"])
+        body["max_chars"] = line_budget(body.get("font_name", base["font_name"]),
+                                        body.get("font_size", base["font_size"]))
     resp = await client.post("/api/subtitle", json=body)
     if resp.status_code >= 400:
         return _api_error(resp), True

@@ -410,7 +410,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
       await new Promise((resolve, reject) => {
         const interval = setInterval(async () => {
           try {
-            const statusRes = await fetch(getApiUrl(`/api/thumbnail/publish/status/${publish_id}`));
+            const statusRes = await apiFetch(`/api/thumbnail/publish/status/${publish_id}`);
             if (!statusRes.ok) { clearInterval(interval); reject(new Error('Status check failed')); return; }
             const statusData = await statusRes.json();
 
@@ -471,7 +471,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
         {/* Header */}
         <div className="flex items-end justify-between mb-2">
           <div>
-            <p className="eyebrow mb-2">05 · YOUTUBE STUDIO</p>
+            <p className="eyebrow mb-2">06 · YOUTUBE STUDIO</p>
             <h1 className="font-display lowercase text-2xl text-ink flex items-center gap-3">
               <span className="w-10 h-10 rounded-card bg-paper3 flex items-center justify-center">
                 <Image size={18} className="text-brass" />

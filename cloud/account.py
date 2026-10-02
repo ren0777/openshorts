@@ -41,7 +41,8 @@ from . import database, email_policy, storage
 from .models import (
     User, Subscription, CreditTopup, UsageLedger, MagicLinkToken,
     SignupAttribution, ApiKey, UploadPostProfile, UserVideo, ClipExpiryWarning,
-    Project, AccountDeletion, OAuthCode,
+    Project, AccountDeletion, OAuthCode, AutopilotRun, AutopilotSettings,
+    LifecycleEmail, CancellationFeedback, OnboardingSurvey,
 )
 
 # Every table that holds rows belonging to a user, child-first (clip_expiry_
@@ -56,6 +57,8 @@ from .models import (
 USER_OWNED_TABLES = (
     ClipExpiryWarning, UserVideo, Project, UsageLedger, CreditTopup,
     Subscription, ApiKey, SignupAttribution, UploadPostProfile, OAuthCode,
+    AutopilotRun, AutopilotSettings, LifecycleEmail, CancellationFeedback,
+    OnboardingSurvey,
 )
 
 # The optional "why are you leaving" answer, as a closed list. It was a free
@@ -91,6 +94,28 @@ def _now():
 def email_fingerprint(email: str) -> str:
     """The only trace of an address that outlives the account."""
     return hashlib.sha256(email_policy.normalize_email(email).encode()).hexdigest()
+
+
+async def free_plan_denial_for_signup(session, email: str) -> Optional[str]:
+    """``User.free_plan_denied`` value for a brand-new account, or None.
+
+    An address whose account was erased in the last FREE_REDO_BLOCK_DAYS
+    comes back without the free allowance: the ledger is keyed by user id, so
+    a new row would otherwise start the month with a fresh 20 minutes. Paid
+    plans and top-ups work as for anyone. Matched on the same fingerprint the
+    erasure stored, so it needs no new personal data.
+    """
+    from .config import FREE_REDO_BLOCK_DAYS
+    if not email or FREE_REDO_BLOCK_DAYS <= 0:
+        return None
+    since = _now() - timedelta(days=FREE_REDO_BLOCK_DAYS)
+    hit = (await session.execute(
+        select(AccountDeletion.id).where(
+            AccountDeletion.email_sha256 == email_fingerprint(email),
+            AccountDeletion.deleted_at >= since,
+        ).limit(1)
+    )).scalar_one_or_none()
+    return "recreated_after_deletion" if hit is not None else None
 
 
 async def _session_user(request: Request):

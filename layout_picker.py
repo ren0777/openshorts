@@ -99,6 +99,53 @@ def apply(decision):
     return touched
 
 
+def _encode_frame(frame, width):
+    import cv2
+
+    h, w = frame.shape[:2]
+    scaled = cv2.resize(frame, (width, max(2, int(h * width / w))),
+                        interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", scaled, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    return buf.tobytes() if ok else None
+
+
+def _ffmpeg_frames(video_path, n):
+    """The same evenly spread frames, decoded by the ffmpeg CLI.
+
+    OpenCV's bundled FFmpeg has no software AV1 decoder, so on the AV1 sources
+    YouTube often serves every read failed ("Failed to get pixel format") and
+    the picker fell back to the default layout for the whole video (prod,
+    25-sep-2026). The system ffmpeg decodes AV1 with libdav1d.
+    """
+    import subprocess
+
+    import cv2
+    import numpy as np
+
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", video_path],
+            capture_output=True, text=True, timeout=60)
+        duration = float(probe.stdout.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    frames = []
+    for i in range(n):
+        try:
+            r = subprocess.run(
+                ["ffmpeg", "-v", "error", "-ss", f"{i * duration / n:.3f}",
+                 "-i", video_path, "-frames:v", "1", "-c:v", "png",
+                 "-f", "image2pipe", "-"],
+                capture_output=True, timeout=120)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        frame = cv2.imdecode(np.frombuffer(r.stdout, np.uint8), cv2.IMREAD_COLOR)
+        if frame is not None:
+            frames.append(frame)
+    return frames
+
+
 def sample_frames(video_path, n=None, width=None):
     """JPEG bytes for ``n`` frames spread evenly across the video."""
     import cv2
@@ -109,22 +156,19 @@ def sample_frames(video_path, n=None, width=None):
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     out = []
     try:
-        if total <= 0:
-            return out
-        for i in range(n):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(i * total / n))
-            ok, frame = cap.read()
-            if not ok:
-                continue
-            h, w = frame.shape[:2]
-            scaled = cv2.resize(frame, (width, max(2, int(h * width / w))),
-                                interpolation=cv2.INTER_AREA)
-            ok, buf = cv2.imencode(".jpg", scaled,
-                                   [cv2.IMWRITE_JPEG_QUALITY, 80])
-            if ok:
-                out.append(buf.tobytes())
+        if total > 0:
+            for i in range(n):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(i * total / n))
+                ok, frame = cap.read()
+                if not ok:
+                    continue
+                jpg = _encode_frame(frame, width)
+                if jpg:
+                    out.append(jpg)
     finally:
         cap.release()
+    if not out and os.path.exists(video_path):
+        out = [j for j in (_encode_frame(f, width) for f in _ffmpeg_frames(video_path, n)) if j]
     return out
 
 

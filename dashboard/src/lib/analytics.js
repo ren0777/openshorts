@@ -1,4 +1,5 @@
 import { allows } from './consent';
+import { firstTouchProps } from './attribution';
 
 // Lightweight custom-event helper (OpenPanel).
 //
@@ -17,6 +18,12 @@ import { allows } from './consent';
 //                          'wall' | 'upsell' | 'pricing')
 //   - CheckoutRedirected — Stripe returned a URL and we are sending them there
 //   - CheckoutFailed     — /api/billing/checkout errored, `reason` says why
+//   - PartialClipChosen  — the wall's "clip the first N min" taken instead of a
+//                          plan (`required` / `partial` minutes)
+//   - FirstVideoGrant    — free account's first video (<= 60 min) clipped whole
+//                          past its balance, no wall shown
+//   - AutoPartial        — free source past the balance clipped to the first N
+//                          minutes by the server, no wall shown
 //   - Subscribed         — plan activated after checkout
 //   - SocialNudgeSeen    — post-generation "connect socials" banner rendered
 //   - SocialNudgeConnect — its connect button clicked (opens hosted connect page)
@@ -24,17 +31,29 @@ import { allows } from './consent';
 //   - ClipTutorialStarted  — first-login tutorial: user hit Start
 //   - ClipTutorialSkipped  — first-login tutorial dismissed (intro or coach)
 //   - ClipTutorialCompleted— first Clip Generator job finished with clips
+//   - JobResumedAfterSignin— a job started signed-out was replayed after the
+//                          sign-in (App.jsx), instead of being dropped
 // The Started → Redirected → Subscribed chain is what separates "never reached
 // Stripe" from "reached Stripe and abandoned"; before 2-ago-2026 the modals
 // emitted only their own *Checkout event and the difference was invisible.
 // Prices ride along as ordinary props (e.g. value_usd) for breakdowns.
+// Conversion events carry the visitor's first touch (landing page, referrer,
+// campaign). A signup happens after the Google/magic-link redirect, in a new
+// OpenPanel session whose entry page is always "/", so without these props
+// every signup looked like it came from the homepage and the SEO pages showed
+// zero conversions (7,481 of 7,481 signup_attribution rows in the 30 days to
+// 23-sep-2026 said landing_path "/").
+const FIRST_TOUCH_EVENTS = new Set(['Signup', 'CheckoutStarted', 'Subscribed']);
+
 export function track(event, options) {
   try {
     // `op` is a queueing stub until consent loads op1.js, so a call made before
     // the visitor accepted would be flushed the moment they did. Check first.
     if (!allows('analytics')) return;
     if (typeof window !== 'undefined' && typeof window.op === 'function') {
-      window.op('track', event, (options && options.props) || {});
+      const props = (options && options.props) || {};
+      window.op('track', event,
+        FIRST_TOUCH_EVENTS.has(event) ? { ...firstTouchProps(), ...props } : props);
     }
   } catch (_) {
     /* analytics must never throw into the app */

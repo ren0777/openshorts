@@ -6,6 +6,9 @@ import pytest
 from clip_selection import (
     build_transcript_windows,
     clip_count_targets,
+    dedupe_overlapping,
+    score_batches,
+    shortlist_target,
     snap_clip_to_words,
     compact_words,
     lookup_model_prices,
@@ -215,3 +218,88 @@ class TestTrimToBest:
     def test_max_clips_is_never_below_one(self):
         shorts = [self._clip(0, 10), self._clip(50, 20)]
         assert len(trim_to_best(shorts, 0)) == 1
+
+
+class TestDedupeOverlapping:
+    """Two picks from one window can cover the same seconds with different
+    edges; the DIVERSITY rule in the prompt is not a guarantee."""
+
+    @staticmethod
+    def _clip(start, end, score):
+        return {"start": start, "end": end, "predicted_score": score}
+
+    def test_keeps_the_better_scored_of_two_overlapping(self):
+        a, b = self._clip(10, 40, 70), self._clip(20, 50, 85)  # 20 s shared of 30 s
+        assert dedupe_overlapping([a, b]) == [b]
+        assert dedupe_overlapping([b, a]) == [b]
+
+    def test_small_overlap_keeps_both_in_input_order(self):
+        # 5 s shared of 30 s: under the ratio, both survive, order untouched
+        # (the detail pass already hands clips back in transcript order).
+        a, b = self._clip(10, 40, 70), self._clip(35, 65, 85)
+        assert dedupe_overlapping([a, b]) == [a, b]
+
+    def test_tie_keeps_the_earlier(self):
+        a, b = self._clip(10, 40, 80), self._clip(15, 45, 80)
+        assert dedupe_overlapping([a, b]) == [a]
+
+    def test_disjoint_untouched(self):
+        clips = [self._clip(0, 30, 50), self._clip(30, 60, 60), self._clip(100, 130, 40)]
+        assert dedupe_overlapping(clips) == clips
+
+
+class TestScoreBatches:
+    """The scoring pass must be able to fill the shortlist it is aiming for.
+
+    Regression for 22-sep-2026: a 9:10 source built 9 windows, was batched
+    8 + 1 against a prompt capped at "up to 3 windows", and shortlisted 4 of
+    a target of 8 — which halved the clip floor downstream.
+    """
+
+    @staticmethod
+    def _windows(n):
+        return [{"id": f"w{i}", "start": i * 60, "end": i * 60 + 90, "text": "t"}
+                for i in range(n)]
+
+    def test_every_window_is_scored_exactly_once_and_in_order(self):
+        # The shortlist is the global top N of the scores, so a window that
+        # never reaches the model can never be picked.
+        for n in (1, 2, 7, 8, 9, 17, 38):
+            batches = score_batches(self._windows(n), 8)
+            seen = [w["id"] for batch in batches for w in batch]
+            assert seen == [w["id"] for w in self._windows(n)]
+
+    def test_the_nine_window_case_has_no_tail_of_one(self):
+        # The measured job split 9 into 8 + 1, and a batch of 1 cannot be
+        # filtered: window_009 entered the shortlist by arithmetic.
+        assert [len(b) for b in score_batches(self._windows(9), 8)] == [5, 4]
+
+    def test_batches_are_near_equal_and_within_the_size_limit(self):
+        for n in (9, 16, 17, 38, 100):
+            sizes = [len(b) for b in score_batches(self._windows(n), 8)]
+            assert max(sizes) <= 8
+            assert max(sizes) - min(sizes) <= 1
+            assert sum(sizes) == n
+
+    def test_batch_count_is_never_worse_than_the_naive_walk(self):
+        # Balancing must not cost extra Gemini calls.
+        for n in range(1, 60):
+            naive = -(-n // 8)
+            assert len(score_batches(self._windows(n), 8)) == naive
+
+    def test_degenerate_input_does_not_crash(self):
+        assert score_batches([], 8) == []
+        assert score_batches(None, 8) == []
+        assert [len(b) for b in score_batches(self._windows(2), 0)] == [1, 1]
+
+
+class TestShortlistTarget:
+    def test_scales_with_duration_and_is_capped(self):
+        assert shortlist_target(60) == 3          # floor
+        assert shortlist_target(9 * 60) == 8      # the measured job
+        assert shortlist_target(60 * 60) == 10    # ceiling
+        assert shortlist_target(3 * 60 * 60) == 10
+
+    def test_degenerate_input_does_not_crash(self):
+        assert shortlist_target(None) == 3
+        assert shortlist_target("nonsense") == 3

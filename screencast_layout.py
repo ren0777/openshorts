@@ -192,7 +192,7 @@ def detect_content_ranges(video_path, video_duration):
     file_upload = None
     try:
         client = genai.Client(api_key=api_key)
-        file_upload = client.files.upload(file=video_path)
+        file_upload = gemini_worker.upload_media(client, video_path)
         deadline = time.time() + 180
         while True:
             info = client.files.get(name=file_upload.name)

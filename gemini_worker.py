@@ -1,5 +1,6 @@
 import argparse
 import json
+import mimetypes
 import os
 import sys
 from typing import List, Optional
@@ -39,6 +40,10 @@ class DetailClipModel(BaseModel):
     video_description_for_instagram: str
     video_title_for_youtube_short: str
     viral_hook_text: str
+    # One sentence on what makes THIS moment a clip, shown under the score in
+    # the dashboard. Defaulted so a small local model that skips it does not
+    # fail schema validation and lose the clip.
+    why: str = ""
 
 
 class DetailResponse(BaseModel):
@@ -244,19 +249,22 @@ def _log(message: str) -> None:
 
 SCORE_PROMPT_TEMPLATE = """
 You are a senior short-form video strategist.
-Select the MOST viral candidate windows from this batch.
+RANK these candidate windows by how well each would work as a standalone short.
 
 Rules:
 - Return only valid JSON.
-- Choose up to 3 windows from this batch.
-- `score` must be an integer from 0 to 100.
+- Score EVERY window in this batch: exactly one entry per input window, with
+  the id you were given. Do not drop the weak ones — say they are weak.
+- `score` must be an integer from 0 to 100, and the ranking is what matters:
+  use the whole range instead of clustering. Most windows of a normal video
+  are not clippable, so reserve 70+ for the ones that pass the test below,
+  and put weak filler, housekeeping, outros, rambling transitions and
+  low-signal padding under 30 even when the topic is interesting.
 - THE 2-SECOND TEST is the main criterion: would the first 2 seconds of this
   moment force a cold viewer (no context) to keep watching? Windows that only
   work with prior context score low.
 - Prefer windows with strong hooks, conflict, surprise, outrage, emotion,
   novelty, big numbers, or a clear payoff.
-- Ignore weak filler, housekeeping, outros, rambling transitions, and
-  low-signal padding unless there is an obvious hook or payoff.
 
 TRANSCRIPT_LANGUAGE: {language}
 VIDEO_DURATION_SECONDS: {video_duration}
@@ -326,6 +334,8 @@ COPY RULES — ALL text fields (descriptions, title, hook) MUST be written in TR
   without spoiling it, then 3-5 topically relevant hashtags. No generic hashtag spam.
 - `video_title_for_youtube_short`: max 100 chars, curiosity-driven, no fake claims.
 - `predicted_score`: honest 0-100 estimate of viral potential.
+- `why`: one sentence, max 20 words, naming what makes THIS moment worth a
+  clip — the specific hook, claim, number or payoff, not the topic.
 
 TRANSCRIPT_LANGUAGE: {language}
 VIDEO_DURATION_SECONDS: {video_duration}
@@ -343,7 +353,8 @@ Return only:
       "video_description_for_tiktok": "<description + hashtags>",
       "video_description_for_instagram": "<description + hashtags>",
       "video_title_for_youtube_short": "<title max 100 chars>",
-      "viral_hook_text": "<short overlay max 10 words>"
+      "viral_hook_text": "<short overlay max 10 words>",
+      "why": "<one sentence, max 20 words>"
     }}
   ]
 }}
@@ -403,6 +414,34 @@ def _parse_json_response_text(text: str) -> dict:
         except json.JSONDecodeError as e:
             last_error = e
     raise ValueError(f"Failed to parse Gemini JSON response: {last_error}")
+
+
+def upload_media(client, path, mime_type=None):
+    """Upload a local file to the Gemini Files API, by handle and never by path.
+
+    Handed a path, the SDK copies ``os.path.basename(path)`` verbatim into the
+    ``X-Goog-Upload-File-Name`` header, and httpx encodes header values as
+    ASCII. The downloaded source is named after the video's title, so every
+    video whose title is written in Japanese, Cyrillic, Arabic or Greek died
+    before a byte left the container with ``'ascii' codec can't encode
+    characters in position 0-4`` (prod, 20-sep-2026) — on the three stages
+    that upload the whole file: the silent-footage vision pass, the screencast
+    detector and the AI editor. Passing an open handle skips that header
+    entirely; the readable name still travels as ``display_name``, which goes
+    in the JSON body and is UTF-8 all the way.
+    """
+    guessed = mime_type or mimetypes.guess_type(path)[0] or ""
+    # Every caller uploads the source video; an extension the stdlib does not
+    # know (or knows as octet-stream) must not reach the API as a type it
+    # refuses, so fall back to the container the pipeline always writes.
+    if not guessed.startswith(("video/", "audio/", "image/")):
+        guessed = "video/mp4"
+    with open(path, "rb") as fh:
+        return client.files.upload(
+            file=fh,
+            config={"mime_type": guessed,
+                    "display_name": os.path.basename(path)},
+        )
 
 
 class GeminiBlockedError(ValueError):
@@ -560,7 +599,7 @@ def main() -> int:
     if args.mode != "score":
         # Score mode receives every window, not a shortlist, so a count target
         # derived from it would be meaningless — and the score template has no
-        # placeholder for one anyway.
+        # placeholder for one: it ranks whatever it is given.
         fmt["min_clips"], fmt["max_clips"] = clip_count_targets(len(payload.get("windows") or []))
         fmt["min_secs"], fmt["max_secs"] = clip_duration_bounds()
     prompt = template.format(**fmt)

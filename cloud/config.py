@@ -32,6 +32,10 @@ PLAN_MINUTES = {
 # cloud/metering.py against a synthetic calendar-month period. Setting
 # FREE_PLAN_MINUTES = 0 disables the free plan.
 FREE_PLAN_MINUTES = 20
+# An address erased (DELETE /api/account) within this many days gets no free
+# minutes when it signs up again: deleting and re-registering was a way to
+# reset the monthly allowance (15 re-registrations by 6 accounts, sep-2026).
+FREE_REDO_BLOCK_DAYS = 90
 # Free is open to Google accounts AND permanent email accounts; disposable /
 # temp-mail domains are blocked at sign-up (cloud/email_policy) and aliases are
 # normalized, so the plan isn't a multi-account faucet.
@@ -60,6 +64,45 @@ BILLING_ATTENTION_STATES = ("past_due", "unpaid", "incomplete", "paused")
 # collecting on 'incomplete' (payment abandoned at 3DS/confirm, expired by Stripe
 # within 24h), so blocking that would only stop the retry.
 CHECKOUT_BLOCKING_STATES = ("active", "trialing", "past_due", "unpaid", "paused")
+
+def new_subscriber_label(status: str):
+    """Admin-alert text for a brand-new subscription row, or None to stay silent.
+
+    Only states where a payment method actually went through count. Stripe
+    creates the row as 'incomplete' seconds after the Checkout page opens,
+    before the user types anything; announcing that is announcing a click.
+    Lives here (not in billing.py) so the test runs without the stripe SDK.
+    """
+    if status == "trialing":
+        return "trial started — card on file"
+    if status == "active":
+        return status
+    return None
+
+
+# Smallest slice of a long video worth offering instead of the quota wall.
+# A user whose remaining minutes cannot cover the whole source is offered its
+# first N minutes (N = what they have left) so they see clips before paying:
+# 93 of the 99 walls sampled to 16-sep-2026 were shown to accounts with their
+# 20 free minutes untouched, pasting a 21-90 min video, and most left Stripe
+# without paying. Below this many minutes the slice cannot hold a few 15-60 s
+# clips, so the wall stays as it was.
+PARTIAL_MIN_MINUTES = 5
+
+# A free account's FIRST video is clipped whole when it runs up to this many
+# minutes, even past the 20-minute balance: the balance goes to zero and the
+# user sees every clip of the video they came with. Once per account (any
+# reserved/committed process job disqualifies it), and the free plan itself is
+# already gated (Google or permanent email, re-registration blocked 90 days).
+# Longer first videos, and every later one past the balance, are clipped to
+# the first N minutes automatically instead of hitting the wall.
+# 0 disables the grant.
+FIRST_VIDEO_MAX_MINUTES = 60
+# ...and once per client IP in this many days, whatever the account: a pile of
+# Google accounts from one network gets one whole first video, and the rest
+# fall back to the first-N-minutes cut. The IP is kept only as an HMAC
+# (cloud/metering.ip_fingerprint) and rows older than the window are deleted.
+FIRST_VIDEO_IP_WINDOW_DAYS = 30
 
 # Minute cap DURING the trial (across all plans). Kept for grandfathered
 # 'trialing' subscriptions; removable once no subscription has status

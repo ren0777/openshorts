@@ -9,6 +9,7 @@ from ffmpeg_utils import (
     METADATA_SCRUB,
     QUALITY,
     QUALITY_FAST,
+    blurred_backdrop,
     mark_ai_generated,
     reset_encoder_cache,
     video_encode_args,
@@ -18,6 +19,7 @@ from ffmpeg_utils import (
 @pytest.fixture(autouse=True)
 def _clean_encoder_state(monkeypatch):
     monkeypatch.delenv("FFMPEG_ENCODER", raising=False)
+    monkeypatch.setattr(ffmpeg_utils, "_gpu_cut_sources", {})
     reset_encoder_cache()
     yield
     reset_encoder_cache()
@@ -208,3 +210,40 @@ def test_every_attempt_failing_raises_with_ffmpeg_stderr(_cut):
     with pytest.raises(RuntimeError, match="Invalid data found"):
         _cut([(1, 0, "Invalid data found when processing input")] * attempts)
     assert _cut.slept == list(ffmpeg_utils.CUT_RETRY_WAITS)
+
+
+def test_backdrop_blurs_at_quarter_size_and_fills_the_frame():
+    chain = blurred_backdrop(1080, 1920, 12)
+    assert "scale=-2:480,crop=w=min(iw\\,270):h=480" in chain
+    assert "gblur=sigma=3," in chain
+    assert chain.endswith("scale=1080:1920")
+
+
+def _gpu_source(monkeypatch, codec_pix):
+    monkeypatch.setattr(ffmpeg_utils, "_gpu_cut_sources", {})
+    monkeypatch.setattr(ffmpeg_utils, "_source_format",
+                        lambda path: tuple(codec_pix.split(",")))
+
+
+def test_cut_stays_on_the_gpu_for_8bit_420(_cut, monkeypatch):
+    _gpu_source(monkeypatch, "h264,yuv420p")
+    cmd = _cut([(0, 5_000_000, "")]).commands[0]
+    assert cmd[cmd.index("-hwaccel") + 1] == "cuda"
+    assert cmd[cmd.index("-hwaccel_output_format") + 1] == "cuda"
+    assert "-pix_fmt" not in cmd
+    assert "h264_nvenc" in cmd
+
+
+def test_cut_decodes_10bit_sources_on_the_cpu(_cut, monkeypatch):
+    _gpu_source(monkeypatch, "hevc,yuv420p10le")
+    cmd = _cut([(0, 5_000_000, "")]).commands[0]
+    assert "-hwaccel" not in cmd
+    assert cmd[cmd.index("-pix_fmt") + 1] == "yuv420p"
+
+
+def test_failed_gpu_cut_falls_back_to_the_cpu_decode(_cut, monkeypatch):
+    _gpu_source(monkeypatch, "av1,yuv420p")
+    fake = _cut([(1, 0, "cuvid error"), (0, 5_000_000, "")])
+    assert "-hwaccel" in fake.commands[0]
+    assert "-hwaccel" not in fake.commands[1]
+    assert len(fake.commands) == 2

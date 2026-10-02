@@ -235,3 +235,67 @@ class TestStatusFromDisk:
         app_module.jobs["j1"] = {"status": "queued", "logs": ["Job queued"]}
         app_module._begin_drain("test")
         assert app_module._presented_status("j1", app_module.jobs["j1"]) == "processing"
+
+
+class TestSharedGpu:
+    """The new instance must not stack a full set of jobs on top of the ones
+    the draining instance is still running on the same GPU."""
+
+    def test_counts_only_fresh_jobs_of_other_instances(self, out):
+        now = time.time()
+        _manifest(out, "a", instance="old", heartbeat=now - 5)
+        _manifest(out, "b", instance="old", heartbeat=now - 5)
+        _manifest(out, "c", instance="old", heartbeat=now - 600)   # stale
+        _manifest(out, "d", instance="me", heartbeat=now - 5)      # ours
+        _manifest(out, "e")                                         # queued, no heartbeat
+        (out / "no-manifest").mkdir()
+        assert app_module._jobs_busy_elsewhere(now) == 2
+
+    def test_waits_while_the_gpu_is_full(self, out, monkeypatch):
+        monkeypatch.setattr(app_module, "MAX_CONCURRENT_JOBS", 3)
+        monkeypatch.setattr(app_module, "SHARED_GPU_WAIT_SECONDS", 0.01)
+        busy = {"n": 3}
+        monkeypatch.setattr(app_module, "_jobs_busy_elsewhere", lambda now=None: busy["n"])
+        monkeypatch.setattr(app_module, "_gpu_free_mb", lambda: None)
+        calls = {"n": 0}
+        real_sleep = asyncio.sleep
+
+        async def fake_sleep(sec):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                busy["n"] = 1     # the old instance finished two jobs
+            await real_sleep(0)
+        monkeypatch.setattr(app_module.asyncio, "sleep", fake_sleep)
+        asyncio.run(app_module._wait_for_shared_gpu())
+        assert calls["n"] == 3
+
+    def test_no_wait_when_alone(self, out, monkeypatch):
+        monkeypatch.setattr(app_module, "MAX_CONCURRENT_JOBS", 3)
+        monkeypatch.setattr(app_module, "_running_jobs", {"x", "y"})
+        monkeypatch.setattr(app_module, "_jobs_busy_elsewhere", lambda now=None: 0)
+        monkeypatch.setattr(app_module, "_gpu_free_mb", lambda: 20000)
+
+        async def boom(sec):
+            raise AssertionError("should not wait")
+        monkeypatch.setattr(app_module.asyncio, "sleep", boom)
+        asyncio.run(app_module._wait_for_shared_gpu())
+
+
+class TestGpuHasRoom:
+    def test_count_limit(self, out, monkeypatch):
+        monkeypatch.setattr(app_module, "MAX_CONCURRENT_JOBS", 8)
+        assert not app_module.gpu_has_room(5, 3, 20000)
+
+    def test_needs_free_vram_when_something_runs(self, out, monkeypatch):
+        monkeypatch.setattr(app_module, "MAX_CONCURRENT_JOBS", 8)
+        monkeypatch.setattr(app_module, "GPU_MIN_FREE_MB", 4500)
+        assert not app_module.gpu_has_room(3, 0, 1200)
+        assert app_module.gpu_has_room(3, 0, 6000)
+
+    def test_idle_card_always_starts(self, out, monkeypatch):
+        monkeypatch.setattr(app_module, "GPU_MIN_FREE_MB", 4500)
+        assert app_module.gpu_has_room(0, 0, 100)
+
+    def test_no_nvidia_smi_falls_back_to_count(self, out, monkeypatch):
+        monkeypatch.setattr(app_module, "MAX_CONCURRENT_JOBS", 8)
+        assert app_module.gpu_has_room(4, 0, None)

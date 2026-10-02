@@ -67,8 +67,6 @@ reserves.
 
 ## 6. Dashboard tweaks
 
-- **Subtitle font size control** (12–36 px slider + number input) in the
-  subtitle modal; default caption size reduced to fit 9:16 better.
 - **An Upload-Post key is no longer required to generate clips.** It is only
   needed to publish to social media, so it is now checked only for that.
 - Frontend dev port is `6100` (was `5175`).

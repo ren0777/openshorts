@@ -125,6 +125,51 @@ class TestGenerateAss:
         assert content.count("{\\r}") == 3          # reset to dimmed base style
         assert "Style: Default,Verdana," in content
 
+    def _render(self, tmp_path, **kw):
+        from subtitles import generate_ass
+        out = tmp_path / "subs.ass"
+        words = [_w(" one", 0.0, 0.3), _w(" two", 0.3, 0.6), _w(" three", 0.6, 0.9)]
+        assert generate_ass(self._transcript(words), 0, 10, str(out), **kw) is True
+        return out.read_text(encoding="utf-8-sig")
+
+    def test_highlight_puts_active_word_on_a_box(self, tmp_path):
+        content = self._render(tmp_path, effect="highlight", highlight_color="#7C3AED")
+        active = [l for l in content.splitlines() if l.startswith("Style: Active,")]
+        assert len(active) == 1
+        fields = active[0].split(",")
+        assert fields[15] == "3"                      # BorderStyle 3 = opaque box
+        assert fields[6] == "&H00ED3A7C"              # box in the highlight colour
+        assert fields[3] == "&H00FFFFFF"              # white text on a dark box
+        assert content.count("{\\rActive}") == 3
+
+    def test_highlight_light_box_gets_black_text(self, tmp_path):
+        content = self._render(tmp_path, effect="highlight", highlight_color="#FFE500")
+        active = next(l for l in content.splitlines() if l.startswith("Style: Active,"))
+        assert active.split(",")[3] == "&H00000000"
+
+    def test_reveal_hides_words_not_spoken_yet(self, tmp_path):
+        content = self._render(tmp_path, reveal=True)
+        events = [l for l in content.splitlines() if l.startswith("Dialogue:")]
+        # First word active: the two after it are invisible; last word: none.
+        assert events[0].count("\\alpha&HFF&") == 2
+        assert events[2].count("\\alpha&HFF&") == 0
+        assert "\\alpha" not in self._render(tmp_path)
+
+    def test_shadow_without_outline_is_the_clean_look(self, tmp_path):
+        content = self._render(tmp_path, border_width=0, shadow=2)
+        fields = next(l for l in content.splitlines() if l.startswith("Style: Default,")).split(",")
+        assert (fields[16], fields[17]) == ("0", "2")   # Outline, Shadow
+        # Without a shadow, "no border" keeps the 1px floor it always had.
+        fields = next(l for l in self._render(tmp_path, border_width=0).splitlines()
+                      if l.startswith("Style: Default,")).split(",")
+        assert (fields[16], fields[17]) == ("1", "0")
+
+    def test_max_chars_one_shows_one_word_at_a_time(self, tmp_path):
+        content = self._render(tmp_path, max_chars=1)
+        events = [l for l in content.splitlines() if l.startswith("Dialogue:")]
+        assert len(events) == 3
+        assert all(" " not in e.split(",,", 1)[1].replace("{\\r}", "") for e in events)
+
     def test_karaoke_merges_fragments_too(self, tmp_path):
         from subtitles import generate_ass
         out = tmp_path / "subs.ass"

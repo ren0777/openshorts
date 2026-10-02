@@ -95,7 +95,9 @@ async def google_callback(request: Request):
                     select(User).where(User.email == email)
                 )).scalar_one_or_none()
                 if user is None:
-                    user = User(email=email, google_sub=google_sub, last_login_at=_now())
+                    from .account import free_plan_denial_for_signup
+                    user = User(email=email, google_sub=google_sub, last_login_at=_now(),
+                                free_plan_denied=await free_plan_denial_for_signup(session, email))
                     session.add(user)
                     await session.flush()
                 else:

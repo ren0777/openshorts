@@ -243,6 +243,7 @@ export default function Landing({ onLaunchApp }) {
             {billingEnabled && <a href="#pricing" className="hover:text-ink transition-colors">Pricing</a>}
             <a href="#comparison" className="hover:text-ink transition-colors">Comparison</a>
             <a href="#faq" className="hover:text-ink transition-colors">FAQ</a>
+            <a href="/tools" className="hover:text-ink transition-colors">Free tools</a>
           </div>
           <div className="flex items-center gap-3">
             <a
@@ -275,8 +276,12 @@ export default function Landing({ onLaunchApp }) {
               turn long videos into viral 9:16 shorts, or generate ugc marketing videos with ai actors. online, in the cloud, zero setup.
               also a clipping tool for ai agents: claude, chatgpt and n8n drive it over{' '}
               <a href="/mcp" className="text-ink2 underline underline-offset-4 decoration-rule hover:text-ink hover:decoration-brass transition-colors">mcp</a>,
-              or run your channel on autopilot with the{' '}
+              or run your channel on{' '}
+              <a href="/auto-clip" className="text-ink2 underline underline-offset-4 decoration-rule hover:text-ink hover:decoration-brass transition-colors">autopilot</a>{' '}
+              or with the{' '}
               <a href="/n8n-youtube-shorts-automation" className="text-ink2 underline underline-offset-4 decoration-rule hover:text-ink hover:decoration-brass transition-colors">n8n workflow</a>.
+              just want it free? start with the{' '}
+              <a href="/free-ai-clip-generator" className="text-ink2 underline underline-offset-4 decoration-rule hover:text-ink hover:decoration-brass transition-colors">free ai clip generator</a>.
             </p>
 
             {/* The hero CTA is the product itself: paste a link and land in the
@@ -308,7 +313,7 @@ export default function Landing({ onLaunchApp }) {
               <span className="badge-ok whitespace-nowrap">
                 <Check size={12} /> no credit card required
               </span>
-              <span className="text-muted lowercase">20 free min every month</span>
+              <span className="text-muted lowercase">first video free (up to 60 min) · then 20 min every month</span>
               <button
                 onClick={onLaunchApp}
                 className="text-ink2 lowercase underline underline-offset-4 decoration-rule hover:text-ink hover:decoration-brass transition-colors"
@@ -436,7 +441,7 @@ export default function Landing({ onLaunchApp }) {
                 <span className="badge-brass">Recommended · Free Plan</span>
               </div>
               <ul className="space-y-1.5 mb-6 flex-1">
-                {['Our NVIDIA GPU: an 8-min video in about 50s', 'Gemini key included, nothing to set up', 'Social publishing built in', '20 free min/month, no card'].map((f, i) => (
+                {['Our NVIDIA GPU: an 8-min video in about 50s', 'Gemini key included, nothing to set up', 'Social publishing built in', 'First video free up to 60 min, then 20 min/month, no card'].map((f, i) => (
                   <li key={i} className="flex items-center gap-2 text-sm text-muted"><Check size={14} className="text-ok shrink-0" />{f}</li>
                 ))}
               </ul>
@@ -475,7 +480,7 @@ export default function Landing({ onLaunchApp }) {
         <section id="pricing" className="py-20 px-6 border-t border-rule">
           <div className="max-w-6xl mx-auto">
             <SectionHeader eyebrow="03 · Pricing" title="Simple, transparent pricing">
-              Free plan with 20 minutes a month — no credit card. Cancel anytime.
+              Your first video is free, up to 60 minutes. Then 20 free minutes a month — no credit card. Cancel anytime.
             </SectionHeader>
             <PricingSection onRequireLogin={() => { window.location.hash = '#/pricing'; }} />
           </div>
@@ -742,7 +747,7 @@ export default function Landing({ onLaunchApp }) {
       <section className="py-24 px-6 border-t border-rule">
         <div className="max-w-3xl mx-auto text-center">
           <h2 className="font-display text-4xl md:text-5xl lowercase text-ink tracking-tight mb-5">start creating viral videos today.</h2>
-          <p className="text-muted mb-10 max-w-xl mx-auto leading-relaxed lowercase">free plan · 20 min/month · no credit card — or self-host free with docker.</p>
+          <p className="text-muted mb-10 max-w-xl mx-auto leading-relaxed lowercase">first video free (up to 60 min) · then 20 min/month · no credit card — or self-host free with docker.</p>
           <div className="flex flex-wrap items-center justify-center gap-4">
             {billingEnabled ? (
               <a href="#pricing" className="btn-primary whitespace-nowrap">
@@ -774,13 +779,26 @@ export default function Landing({ onLaunchApp }) {
           <p className="font-display text-3xl md:text-5xl lowercase text-ink tracking-tight mb-10">clip it before it scrolls past.</p>
           <nav aria-label="Guides and comparisons" className="border-t border-rule pt-6 mb-6 flex flex-wrap items-center gap-x-6 gap-y-2 text-sm lowercase text-muted">
             <a href="/free-ai-clip-generator" className="hover:text-ink transition-colors">free ai clip generator</a>
+            <a href="/tools" className="hover:text-ink transition-colors">free tools</a>
+            <a href="/youtube-transcript-generator" className="hover:text-ink transition-colors">youtube transcript generator</a>
+            <a href="/youtube-tag-generator" className="hover:text-ink transition-colors">youtube tag generator</a>
+            <a href="/video-aspect-ratio-converter" className="hover:text-ink transition-colors">video to 9:16 converter</a>
+            <a href="/auto-clip" className="hover:text-ink transition-colors">auto clip</a>
+            <a href="/youtube-automation" className="hover:text-ink transition-colors">youtube automation</a>
             <a href="/free-ai-clip-generator-no-watermark" className="hover:text-ink transition-colors">no watermark</a>
             <a href="/open-source-video-clipper" className="hover:text-ink transition-colors">open source video clipper</a>
             <a href="/podcast-to-shorts" className="hover:text-ink transition-colors">podcast to shorts</a>
             <a href="/youtube-to-shorts-converter" className="hover:text-ink transition-colors">youtube to shorts</a>
             <a href="/how-openshorts-works" className="hover:text-ink transition-colors">how it works</a>
             <a href="/alternatives" className="hover:text-ink transition-colors">alternatives</a>
+            <a href="/alternativas" className="hover:text-ink transition-colors">alternativas</a>
             <a href="/alternatives/opus-clip" className="hover:text-ink transition-colors">vs opus clip</a>
+            <a href="/opus-clip-pricing" className="hover:text-ink transition-colors">opus clip pricing</a>
+            <a href="/opus-clip-free-alternative" className="hover:text-ink transition-colors">free opus clip alternative</a>
+            <a href="/opus-ai" className="hover:text-ink transition-colors">opus ai</a>
+            <a href="/opus-pro" className="hover:text-ink transition-colors">opus pro</a>
+            <a href="/vizard-ai-video-to-text" className="hover:text-ink transition-colors">vizard ai video to text</a>
+            <a href="/submagic-reviews" className="hover:text-ink transition-colors">submagic review</a>
             <a href="/mcp" className="hover:text-ink transition-colors">mcp server & api</a>
             <a href="/automate-shorts-api" className="hover:text-ink transition-colors">automate shorts</a>
             <a href="/n8n-youtube-shorts-automation" className="hover:text-ink transition-colors">n8n workflow</a>

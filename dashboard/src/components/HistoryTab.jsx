@@ -56,7 +56,7 @@ export default function HistoryTab({ onReopenProject }) {
 
   return (
     <div className="h-full overflow-y-auto p-8 max-w-5xl mx-auto animate-fade">
-      <p className="eyebrow mb-1.5">06 · HISTORY</p>
+      <p className="eyebrow mb-1.5">07 · HISTORY</p>
       <h1 className="font-display lowercase text-2xl text-ink mb-2">Your library</h1>
       <p className="text-muted text-sm mb-8 lowercase">
         All the shorts you've generated, saved while your plan is active. Kept for 7 days after your plan ends. Reopen a project to keep editing its clips.

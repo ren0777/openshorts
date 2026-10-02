@@ -16,7 +16,8 @@ from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select
 
-from .config import settings, PLAN_MINUTES, TRIAL_DAYS, SUBSCRIPTION_LOOKUP_KEYS, TOPUP_LOOKUP_KEYS
+from .config import (settings, PLAN_MINUTES, TRIAL_DAYS, SUBSCRIPTION_LOOKUP_KEYS,
+                     TOPUP_LOOKUP_KEYS, new_subscriber_label)
 from . import analytics, config, database
 from .models import User, Subscription, CreditTopup, StripeEvent, SignupAttribution
 from .auth import get_current_user_required
@@ -196,6 +197,11 @@ async def create_checkout(body: CheckoutRequest, request: Request):
         # that already converts at ~1%.
         tax_id_collection={"enabled": True},
         customer_update={"name": "auto", "address": "auto"},
+        # An unpaid session expires after 24 h; recovery makes Stripe hand the
+        # checkout.session.expired webhook a URL that reopens the same cart,
+        # which cloud/lifecycle.py mails once (1,011 of 1,126 sessions to
+        # 27-sep-2026 expired unpaid, none followed up).
+        after_expiration={"recovery": {"enabled": True, "allow_promotion_codes": True}},
         metadata={
             "user_id": str(user.id),
             "kind": entry["kind"],
@@ -397,6 +403,12 @@ async def handle_event(event: dict):
         await _track_invoice_revenue(obj)
     elif etype == "charge.refunded":
         await _track_refund(obj)
+    elif etype == "checkout.session.expired":
+        from . import lifecycle
+        try:
+            await lifecycle.on_checkout_expired(obj)
+        except Exception as e:  # an email must never make Stripe retry the event
+            print(f"⚠️  Checkout recovery email failed: {e}")
 
 
 async def _user_id_for_customer(session, customer_id):
@@ -490,6 +502,22 @@ def _sub_period(sub_obj: dict):
     return start, end
 
 
+LIVE_STATUSES = ("active", "trialing")
+
+
+def became_live(prev_status, now_status) -> bool:
+    """The transition that turns a free account into a paid one."""
+    return now_status in LIVE_STATUSES and prev_status not in LIVE_STATUSES
+
+
+async def _unmark_after_upgrade(user_id):
+    try:
+        from . import videos
+        await videos.unmark_user_library(user_id)
+    except Exception as e:
+        print(f"⚠️  Could not unmark the library of {user_id} after upgrade: {e}")
+
+
 async def _upsert_subscription(sub_obj: dict, event_created: datetime):
     price_id = _sub_price_id(sub_obj)
     info = plan_info_for_price(price_id)
@@ -554,10 +582,21 @@ async def _upsert_subscription(sub_obj: dict, event_created: datetime):
                     setattr(row, k, v)
 
     # Purchase alert: someone just subscribed (trial started or paid outright).
+    # Not for 'incomplete': Checkout creates the subscription the moment the
+    # user hits pay, before 3DS / the card answer, so that status only says
+    # someone reached the button. About half of them expire unpaid (24 of 53
+    # in the 30 days to 16-sep-2026), and the ones that do pay are announced
+    # by the 'Payment received' alert on invoice.paid, which carries the
+    # amount; a second message here would just be noise.
     now_status = sub_obj["status"]
-    if is_new_sub:
+    if became_live(prev_status, now_status):
+        # The clips this user already made on the free plan lose their
+        # watermark now (cloud/videos): the upgrade modal promised exactly
+        # that. Fire-and-forget: Stripe must get its 200 whatever R2 does.
+        asyncio.create_task(_unmark_after_upgrade(user_id))
+    label = new_subscriber_label(now_status) if is_new_sub else None
+    if label:
         from .alerts import send_admin_alert
-        label = "trial started — card on file" if now_status == "trialing" else now_status
         await send_admin_alert(
             "🎉 New subscriber",
             f"{buyer_email or 'A user'} started the {plan} ({interval}) plan.\nStatus: {label}.",
@@ -573,9 +612,15 @@ async def _upsert_subscription(sub_obj: dict, event_created: datetime):
     if just_canceled:
         from .alerts import send_admin_alert
         from .config import VIDEO_RETENTION_GRACE_DAYS
+        # Cancelled in the Stripe portal, not the dashboard flow (which flips
+        # the row itself and sends its own alert). The portal's reason, if it
+        # asked for one, is the only feedback there is. The comment is free
+        # text and stays out of Telegram (alerts.user_ref).
+        feedback = (sub_obj.get("cancellation_details") or {}).get("feedback")
         await send_admin_alert(
             "🔻 Subscription canceled",
-            f"A {plan} subscriber just canceled.\n"
+            f"A {plan} subscriber just canceled in the Stripe portal"
+            f"{f' (reason: {feedback})' if feedback else ''}.\n"
             f"Access continues until {end_dt:%Y-%m-%d}. Google-authed users then "
             f"drop to the free plan (clips expire after 7 days); others keep their "
             f"videos {VIDEO_RETENTION_GRACE_DAYS} more days before deletion.",

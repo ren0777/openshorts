@@ -27,6 +27,7 @@ with other models on the host, so loads can OOM under load).
 """
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -49,7 +50,70 @@ PARAKEET_LANGS = {
 # Serializes GPU transcription across concurrent jobs so N jobs can't stack
 # N model contexts / decode batches in VRAM. CPU whisper stays ungated
 # (CTranslate2 models are thread-safe and that matches the old behavior).
-_ASR_GATE = threading.Semaphore(int(os.environ.get("ASR_GPU_CONCURRENCY", "1")))
+_ASR_SLOTS = int(os.environ.get("ASR_GPU_CONCURRENCY", "1"))
+_ASR_GATE = threading.Semaphore(_ASR_SLOTS)
+
+
+# Host-wide cap on GPU transcriptions, across job processes AND across the two
+# containers of a deploy handover (the lock files live on the shared output/
+# volume). _ASR_GATE above only serialises threads inside one process; every
+# main.py job is its own process, so eight jobs could all load Parakeet at
+# once. Peak per transcription is ~4-6 GB on a 20 GB card (prod, 22-sep-2026).
+ASR_HOST_SLOTS = int(os.environ.get("ASR_HOST_SLOTS", "2"))
+ASR_LOCK_DIR = os.environ.get("ASR_LOCK_DIR", "output")
+
+
+class host_asr_slot:
+    """``with host_asr_slot():`` holds one of ASR_HOST_SLOTS flock slots.
+
+    Blocks (polling once a second) until a slot is free. A crashed holder
+    releases its lock with its file descriptor, so a slot can never leak.
+    Degrades to a no-op where flock or the directory is unavailable.
+    """
+
+    def __init__(self, slots=None, lock_dir=None, poll=1.0):
+        self.slots = ASR_HOST_SLOTS if slots is None else slots
+        self.lock_dir = lock_dir or ASR_LOCK_DIR
+        self.poll = poll
+        self._fh = None
+
+    def __enter__(self):
+        if self.slots <= 0:
+            return self
+        try:
+            import fcntl
+            os.makedirs(self.lock_dir, exist_ok=True)
+        except Exception:
+            return self
+        announced = False
+        while True:
+            for i in range(self.slots):
+                path = os.path.join(self.lock_dir, f".asr-gpu-{i}.lock")
+                try:
+                    fh = open(path, "a+")
+                except OSError:
+                    return self
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self._fh = fh
+                    return self
+                except OSError:
+                    fh.close()
+            if not announced:
+                print("🎙️ Waiting for a free transcription slot…", flush=True)
+                announced = True
+            time.sleep(self.poll)
+
+    def __exit__(self, *exc):
+        if self._fh is not None:
+            try:
+                import fcntl
+                fcntl.flock(self._fh, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            self._fh.close()
+            self._fh = None
+        return False
 
 
 class _NullGate:
@@ -114,10 +178,17 @@ def _get_whisper_model():
     return _whisper_model, cfg["device"]
 
 
+def _whisper_device():
+    return "cpu" if _whisper_force_cpu else get_whisper_config()["device"]
+
+
 def _run_whisper_once(media_path, **params):
-    model, device = _get_whisper_model()
-    gate = _ASR_GATE if device != "cpu" else _NULL_GATE
+    gate = _ASR_GATE if _whisper_device() != "cpu" else _NULL_GATE
+    # The model is fetched inside the gate: release_models() drains the gate
+    # before unloading, so a transcription can never start on a model that is
+    # being dropped underneath it.
     with gate:
+        model, _device = _get_whisper_model()
         segments, info = model.transcribe(media_path, **params)
         progress = _TranscribeProgress(getattr(info, "duration", 0))
         materialized = []
@@ -191,18 +262,131 @@ _parakeet_model = None
 _parakeet_lock = threading.Lock()
 
 
+# How many VAD segments (up to 20 s each) the encoder takes per batch. The
+# library default is 8; 4 cuts the peak VRAM of a transcription from ~6.1 to
+# ~4.6 GB for the same words. Benchmarked in prod on 22-sep-2026 over 10 real
+# user videos (40 min of audio, EN/ES/PT/FR-AR, 4,850 words): batch 4 changed
+# 1 word outside the mixed-language clip (which goes to whisper in prod anyway),
+# 0.1 ms mean timestamp drift, +3 s per 20-min video. Batch 2 saved another
+# 0.5 GB but dropped a whole sentence; int8 was 11x slower on this GPU with
+# 11.7% of words different. Don't go below 4 without re-running that check.
+PARAKEET_VAD_BATCH = int(os.environ.get("PARAKEET_VAD_BATCH", "4"))
+
+
+def parakeet_providers():
+    """onnxruntime providers for Parakeet. The arena grows only by what is
+    asked and cuDNN gets no oversized workspace: same numerics (identical
+    transcripts in the benchmark), less memory held."""
+    cuda_opts = {
+        "arena_extend_strategy": "kSameAsRequested",
+        "cudnn_conv_use_max_workspace": "0",
+        "cudnn_conv_algo_search": "HEURISTIC",
+    }
+    return [("CUDAExecutionProvider", cuda_opts), "CPUExecutionProvider"]
+
+
+def parakeet_session_options():
+    """onnxruntime SessionOptions for Parakeet: pool threads sleep, never spin.
+
+    By default every ORT pool thread busy-waits for its next op. On the CUDA
+    path the CPU has almost nothing to do, so that spinning was the work:
+    ~160 CPU-s for a 9-minute video, the biggest CPU cost of a whole job
+    (prod bench 25-sep-2026). Without it: ~35 CPU-s, and the transcript is
+    byte-identical (text and every word timestamp, 3 real videos).
+
+    The VAD gets its own options (vad_load_kwargs).
+    """
+    import onnxruntime as rt
+    opts = rt.SessionOptions()
+    opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    opts.add_session_config_entry("session.inter_op.allow_spinning", "0")
+    return opts
+
+
+def vad_load_kwargs():
+    """Silero VAD on the CPU, one sleeping thread.
+
+    load_vad's default puts Silero on CUDA, where it runs one 32 ms chunk at a
+    time with a host/device copy around each: most of a transcription's wall
+    time. On one CPU thread the whole transcription is 2-3x faster (9 min of
+    audio: 28 s -> 9 s) and cheaper in CPU too. The VAD's numbers are not
+    bit-identical across devices: over 3 real videos (3,939 words) one word
+    changed ("claudio" -> "cloud", for "Claude") and a few word times moved by
+    up to 48 ms (bench, 25-sep-2026).
+    """
+    import onnxruntime as rt
+    opts = rt.SessionOptions()
+    opts.intra_op_num_threads = 1
+    opts.inter_op_num_threads = 1
+    opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    opts.add_session_config_entry("session.inter_op.allow_spinning", "0")
+    return {"sess_options": opts, "providers": ["CPUExecutionProvider"]}
+
+
 def _get_parakeet_model():
     global _parakeet_model
     with _parakeet_lock:
         if _parakeet_model is None:
             import onnx_asr
-            model = onnx_asr.load_model(
-                PARAKEET_MODEL_ID,
-                providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-            )
-            vad = onnx_asr.load_vad("silero")
-            _parakeet_model = model.with_vad(vad).with_timestamps()
+            model = onnx_asr.load_model(PARAKEET_MODEL_ID, providers=parakeet_providers(),
+                                        sess_options=parakeet_session_options())
+            vad = onnx_asr.load_vad("silero", **vad_load_kwargs())
+            _parakeet_model = model.with_vad(
+                vad, batch_size=PARAKEET_VAD_BATCH).with_timestamps()
     return _parakeet_model
+
+
+def release_models():
+    """Drop the resident ASR models and hand their VRAM back to the GPU.
+
+    main.py runs one job per process, so its singletons die with the job.
+    The API process is different: ``/api/subtitle`` on a dubbed clip and the
+    thumbnail studio transcribe in-process, and after the first such request
+    the models sit in the long-lived uvicorn process for good. Measured in
+    prod on 17-sep-2026: the API held 7.7 GB of a 20 GB GPU while idle
+    (ctranslate2 whisper + onnxruntime CUDA parakeet + torch), and with eight
+    jobs running alongside it NVENC could not open a session ("Generic error
+    in an external library", exit 187, 0 bytes) and TransNetV2 hit CUDA OOM:
+    5 of 12 jobs failed. The API calls this after each in-process
+    transcription; a job process never needs to.
+
+    Drains every gate slot first, so no transcription is mid-decode on the
+    model being dropped, and both loaders fetch their model inside the gate.
+    """
+    global _whisper_model, _whisper_key, _parakeet_model
+    for _ in range(_ASR_SLOTS):
+        _ASR_GATE.acquire()
+    try:
+        with _whisper_lock:
+            whisper, _whisper_model, _whisper_key = _whisper_model, None, None
+        with _parakeet_lock:
+            parakeet, _parakeet_model = _parakeet_model, None
+    finally:
+        for _ in range(_ASR_SLOTS):
+            _ASR_GATE.release()
+    if whisper is not None:
+        try:
+            # ctranslate2 frees the weights on unload, not on garbage
+            # collection: the Python wrapper can outlive the last reference.
+            whisper.model.unload_model()
+        except Exception as e:
+            print(f"⚠️ [ASR] whisper unload failed ({type(e).__name__}: {e})")
+    del whisper, parakeet
+    # TransNetV2 is the other torch tenant an in-process pipeline leaves
+    # behind (scene_detection keeps it as a module singleton too).
+    tn2 = sys.modules.get("scene_detection")
+    if tn2 is not None:
+        tn2._tn2_model = None
+    import gc
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    if "onnxruntime" in sys.modules or "faster_whisper" in sys.modules:
+        print("🧹 [ASR] resident models released")
 
 
 def _extract_wav(media_path):
@@ -254,7 +438,6 @@ def _words_from_tokens(tokens, timestamps, seg_start, seg_end):
 
 
 def _transcribe_with_parakeet(media_path):
-    model = _get_parakeet_model()
     wav_path = _extract_wav(media_path)
     try:
         # 16kHz mono s16le wav -> 32000 bytes per second of audio.
@@ -263,6 +446,7 @@ def _transcribe_with_parakeet(media_path):
         except OSError:
             duration = 0.0
         with _ASR_GATE:
+            model = _get_parakeet_model()  # inside the gate: see release_models
             progress = _TranscribeProgress(duration)
             results = []
             for seg in model.recognize(wav_path):

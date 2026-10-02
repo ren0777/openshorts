@@ -210,3 +210,185 @@ def test_run_whisper_transcription_materializes_segments(fake_faster_whisper, mo
     segments, info = tb.run_whisper_transcription("video.mp4")
     assert isinstance(segments, list)
     assert info.language == "es"
+
+
+# --- release_models: the API process must not keep the models resident ------
+
+class _FakeCT2:
+    def __init__(self):
+        self.unloaded = False
+
+    def unload_model(self, to_cpu=False):
+        self.unloaded = True
+
+
+class _FakeWhisper:
+    def __init__(self):
+        self.model = _FakeCT2()
+
+
+def test_release_models_drops_both_singletons_and_unloads_whisper(monkeypatch):
+    whisper = _FakeWhisper()
+    monkeypatch.setattr(tb, "_whisper_model", whisper)
+    monkeypatch.setattr(tb, "_whisper_key", ("large-v3-turbo", "cuda", "float16"))
+    monkeypatch.setattr(tb, "_parakeet_model", object())
+
+    tb.release_models()
+
+    assert tb._whisper_model is None and tb._whisper_key is None
+    assert tb._parakeet_model is None
+    assert whisper.model.unloaded  # ctranslate2 frees VRAM on unload, not on GC
+
+
+def test_release_models_hands_every_gate_slot_back():
+    tb.release_models()
+    # Every slot is free again: a transcription can start right after.
+    for _ in range(tb._ASR_SLOTS):
+        assert tb._ASR_GATE.acquire(blocking=False)
+    for _ in range(tb._ASR_SLOTS):
+        tb._ASR_GATE.release()
+
+
+def test_release_models_is_a_no_op_when_nothing_is_loaded(monkeypatch):
+    monkeypatch.setattr(tb, "_whisper_model", None)
+    monkeypatch.setattr(tb, "_parakeet_model", None)
+    tb.release_models()
+    assert tb._whisper_model is None and tb._parakeet_model is None
+
+
+def test_whisper_model_is_fetched_inside_the_gate(monkeypatch):
+    """release_models drains the gate before unloading; that only protects a
+    transcription if the model is taken *after* the gate is held."""
+    order = []
+
+    class _Gate:
+        def __enter__(self):
+            order.append("gate")
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _Model:
+        def transcribe(self, path, **params):
+            order.append("transcribe")
+            return iter([]), SimpleNamespace(duration=0, language="en")
+
+    monkeypatch.setattr(tb, "_ASR_GATE", _Gate())
+    monkeypatch.setattr(tb, "_whisper_device", lambda: "cuda")
+    monkeypatch.setattr(tb, "_get_whisper_model",
+                        lambda: (order.append("model"), (_Model(), "cuda"))[1])
+
+    tb._run_whisper_once("x.mp4")
+
+    assert order == ["gate", "model", "transcribe"]
+
+
+def test_release_models_drops_the_transnetv2_singleton_too(monkeypatch):
+    import types
+    fake = types.ModuleType("scene_detection")
+    fake._tn2_model = object()
+    monkeypatch.setitem(sys.modules, "scene_detection", fake)
+    monkeypatch.setattr(tb, "_whisper_model", None)
+    monkeypatch.setattr(tb, "_parakeet_model", None)
+
+    tb.release_models()
+
+    assert fake._tn2_model is None
+
+
+class TestHostAsrSlot:
+    """Cross-process cap on GPU transcriptions (flock slots on the shared disk)."""
+
+    def test_slots_are_exclusive_and_released(self, tmp_path):
+        import transcribe_backends as tb
+        a = tb.host_asr_slot(slots=2, lock_dir=str(tmp_path), poll=0.01)
+        b = tb.host_asr_slot(slots=2, lock_dir=str(tmp_path), poll=0.01)
+        with a, b:
+            assert a._fh is not None and b._fh is not None
+            assert a._fh.name != b._fh.name
+        assert a._fh is None and b._fh is None
+
+    def test_third_waits_until_one_frees(self, tmp_path):
+        import threading, time
+        import transcribe_backends as tb
+        first = tb.host_asr_slot(slots=1, lock_dir=str(tmp_path), poll=0.01)
+        first.__enter__()
+        got = []
+
+        def worker():
+            with tb.host_asr_slot(slots=1, lock_dir=str(tmp_path), poll=0.01):
+                got.append(time.monotonic())
+
+        t = threading.Thread(target=worker)
+        t.start()
+        time.sleep(0.1)
+        assert got == []          # still blocked behind the first holder
+        released = time.monotonic()
+        first.__exit__(None, None, None)
+        t.join(2)
+        assert got and got[0] >= released
+
+    def test_disabled_is_a_noop(self, tmp_path):
+        import transcribe_backends as tb
+        with tb.host_asr_slot(slots=0, lock_dir=str(tmp_path)) as s:
+            assert s._fh is None
+
+
+class TestParakeetMemorySettings:
+    def test_vad_batch_default_is_the_benchmarked_one(self):
+        import transcribe_backends as tb
+        assert tb.PARAKEET_VAD_BATCH == 4
+
+    def test_cuda_provider_is_lean_with_cpu_fallback(self):
+        import transcribe_backends as tb
+        (name, opts), cpu = tb.parakeet_providers()
+        assert name == "CUDAExecutionProvider" and cpu == "CPUExecutionProvider"
+        assert opts["arena_extend_strategy"] == "kSameAsRequested"
+        assert opts["cudnn_conv_use_max_workspace"] == "0"
+
+
+def test_parakeet_threads_sleep_and_the_vad_runs_on_one_cpu_thread(monkeypatch):
+    """Spinning ORT threads were most of a job's CPU, and Silero on CUDA most
+    of a transcription's wall time."""
+    class FakeOptions:
+        def __init__(self):
+            self.entries = {}
+            self.intra_op_num_threads = 0
+            self.inter_op_num_threads = 0
+
+        def add_session_config_entry(self, key, value):
+            self.entries[key] = value
+
+    calls = {}
+
+    class FakeModel:
+        def with_vad(self, vad, batch_size):
+            return self
+
+        def with_timestamps(self):
+            return self
+
+    def load_model(model_id, **kw):
+        calls["model"] = kw
+        return FakeModel()
+
+    def load_vad(*a, **kw):
+        calls["vad"] = (a, kw)
+        return object()
+
+    monkeypatch.setitem(sys.modules, "onnxruntime", SimpleNamespace(SessionOptions=FakeOptions))
+    monkeypatch.setitem(sys.modules, "onnx_asr",
+                        SimpleNamespace(load_model=load_model, load_vad=load_vad))
+    monkeypatch.setattr(tb, "_parakeet_model", None)
+
+    tb._get_parakeet_model()
+
+    no_spin = {"session.intra_op.allow_spinning": "0",
+               "session.inter_op.allow_spinning": "0"}
+    assert calls["model"]["sess_options"].entries == no_spin
+    args, kw = calls["vad"]
+    assert args == ("silero",)
+    assert kw["providers"] == ["CPUExecutionProvider"]
+    assert kw["sess_options"].entries == no_spin
+    assert kw["sess_options"].intra_op_num_threads == 1
