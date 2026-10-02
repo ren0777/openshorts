@@ -67,6 +67,11 @@ reserves.
 
 ## 6. Dashboard tweaks
 
+- **Smaller default captions** (size 18, outline 3) for auto-captions and the
+  "Default" preset, so they cover less of a 9:16 frame.
+- **Free font size slider + number box** (12–100) in the subtitle modal,
+  instead of fixed S/M/L/XL steps.
+
 - **An Upload-Post key is no longer required to generate clips.** It is only
   needed to publish to social media, so it is now checked only for that.
 - Frontend dev port is `6100` (was `5175`).

@@ -49,15 +49,12 @@ const ANIMATION_OPTIONS = [
 const ANIMATION_TO_EFFECT = { pop: 'pop', 'word-highlight': 'glow', karaoke: 'highlight', none: 'none' };
 const EFFECT_TO_ANIMATION = { pop: 'pop', glow: 'word-highlight', highlight: 'karaoke', box: 'karaoke', none: 'none' };
 
-// Font size in the units /api/subtitle takes. M is what every clip ships
-// with (subtitles.AUTO_CAPTION_STYLE font_size 44), so opening the modal and
-// applying never shrinks the captions.
-const SIZE_OPTIONS = [
-    { value: 34, label: 'S' },
-    { value: 44, label: 'M' },
-    { value: 56, label: 'L' },
-    { value: 70, label: 'XL' },
-];
+// Font size in the units /api/subtitle takes. The default (18) is what every
+// clip ships with (subtitles.AUTO_CAPTION_STYLE), so opening the modal and
+// applying never changes the captions. The range reaches 100 so the presets'
+// larger sizes (34-70) still fit on the slider.
+const FONT_SIZE_MIN = 12;
+const FONT_SIZE_MAX = 100;
 
 // Characters per line at size M, per font: Anton is condensed, Montserrat
 // wide. Bigger text gets proportionally fewer, so a line still fits the 9:16
@@ -80,7 +77,7 @@ const POSITION_OPTIONS = [
 // dimmed base text + strong active word, optional glow/pop/box effect.
 const CAPTION_PRESETS = [
     // What every clip ships with (subtitles.AUTO_CAPTION_STYLE).
-    { id: 'default', label: 'Default',  style: 'karaoke', effect: 'pop',       highlightColor: '#FFE500', baseOpacity: 1.0, uppercase: true,  fontName: 'Anton', borderWidth: 4, fontSize: 44 },
+    { id: 'default', label: 'Default',  style: 'karaoke', effect: 'pop',       highlightColor: '#FFE500', baseOpacity: 1.0, uppercase: true,  fontName: 'Anton', borderWidth: 3, fontSize: 18 },
     // Trending short-form looks (2026): word-by-word build-up, a box behind
     // the active word, one big word at a time, and the clean shadow-only look.
     { id: 'hormozi', label: 'Hormozi',  style: 'karaoke', effect: 'pop',       highlightColor: '#FFE500', baseOpacity: 1.0, uppercase: true,  fontName: 'Montserrat ExtraBold', borderWidth: 4, shadow: 2, reveal: true, fontSize: 44 },
@@ -118,12 +115,12 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
     // Opens on the look the clip already has (the Default preset), so
     // "apply" without touching anything changes nothing.
     const [position, setPosition] = useState('bottom');
-    const [fontSize, setFontSize] = useState(44);
+    const [fontSize, setFontSize] = useState(18);
     const [fontName, setFontName] = useState('Anton');
     const [fontColor, setFontColor] = useState('#FFFFFF');
     const [highlightColor, setHighlightColor] = useState('#FFE500');
     const [borderColor, setBorderColor] = useState('#000000');
-    const [borderWidth, setBorderWidth] = useState(4);
+    const [borderWidth, setBorderWidth] = useState(3);
     const [bgColor, setBgColor] = useState('#000000');
     const [bgOpacity, setBgOpacity] = useState(0.0);
     const [animation, setAnimationState] = useState('pop');
@@ -160,6 +157,12 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
         setOneWord(!!p.oneWord);
         if (p.fontSize) setFontSize(p.fontSize);
         setAnimationState(p.style === 'karaoke' ? (EFFECT_TO_ANIMATION[p.effect] || 'none') : 'none');
+    };
+
+    const handleFontSizeChange = (value) => {
+        const parsed = Number.parseInt(value, 10);
+        if (Number.isNaN(parsed)) return;
+        setFontSize(Math.min(FONT_SIZE_MAX, Math.max(FONT_SIZE_MIN, parsed)));
     };
 
     const maxChars = lineBudget(fontName, fontSize, oneWord);
@@ -368,15 +371,35 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                             />
                         </div>
 
-                        {/* Size */}
+                        {/* Font Size */}
                         <div>
-                            <p className="eyebrow mb-2">Size</p>
-                            <SegmentedControl
-                                options={SIZE_OPTIONS}
-                                value={fontSize}
-                                onChange={setFontSize}
-                                size="sm"
-                            />
+                            <div className="flex justify-between mb-2">
+                                <p className="eyebrow">Font size</p>
+                                <span className="readout">{fontSize}</span>
+                            </div>
+                            <div className="flex items-center gap-3">
+                                <input
+                                    type="range"
+                                    min={FONT_SIZE_MIN}
+                                    max={FONT_SIZE_MAX}
+                                    value={fontSize}
+                                    onChange={(e) => handleFontSizeChange(e.target.value)}
+                                    className="w-full accent-[var(--color-accent)]"
+                                />
+                                <input
+                                    type="number"
+                                    min={FONT_SIZE_MIN}
+                                    max={FONT_SIZE_MAX}
+                                    value={fontSize}
+                                    onChange={(e) => handleFontSizeChange(e.target.value)}
+                                    className="input-field w-16 px-2 py-1 text-center"
+                                    aria-label="Font size"
+                                />
+                            </div>
+                            <div className="flex justify-between mt-1">
+                                <span className="readout">Small</span>
+                                <span className="readout">Large</span>
+                            </div>
                         </div>
 
                         {style === 'karaoke' && (
