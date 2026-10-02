@@ -2239,6 +2239,9 @@ async def process_endpoint(
     clip_max_seconds: Optional[str] = Form(None),
     auto_hook: Optional[str] = Form(None),
     auto_hook_style: Optional[str] = Form(None),
+    hardsubs: Optional[str] = Form(None),
+    copy_language: Optional[str] = Form(None),
+    pitch: Optional[str] = Form(None),
     thumbnail_session_id: Optional[str] = Form(None),
     captions: Optional[str] = Form(None),
     upload_id: Optional[str] = Form(None),
@@ -2273,6 +2276,9 @@ async def process_endpoint(
         clip_max_seconds = body.get("clip_max_seconds")
         auto_hook = body.get("auto_hook")
         auto_hook_style = body.get("auto_hook_style")
+        hardsubs = body.get("hardsubs")
+        copy_language = body.get("copy_language")
+        pitch = body.get("pitch")
         thumbnail_session_id = body.get("thumbnail_session_id")
         captions = body.get("captions")
         upload_id = body.get("upload_id")
@@ -2405,6 +2411,34 @@ async def process_endpoint(
         if auto_hook_style in HOOK_STYLES:
             env["AUTO_HOOK_STYLE"] = auto_hook_style
         print(f"[auto-hook] job={job_id} style={env.get('AUTO_HOOK_STYLE', 'classic')}")
+
+    # Subtitles burned into the source picture (anime rips): crop their band
+    # off or paint them out of each cut clip before the reframe (hardsubs.py).
+    if str(hardsubs or "").lower() in ("crop", "inpaint", "keep"):
+        env["HARDSUBS"] = str(hardsubs).lower()
+        if env["HARDSUBS"] == "keep":
+            # The source already carries subtitles; a second layer of ours
+            # would sit on top of them.
+            env["AUTO_CAPTIONS"] = "0"
+        print(f"[hardsubs] job={job_id} mode={env['HARDSUBS']}")
+
+    # Hook / title / description language, when it should not follow the
+    # audio (Japanese anime for an English audience). A short language name
+    # or code; anything else is ignored rather than pasted into the prompt.
+    lang = str(copy_language or "").strip()
+    if lang and re.fullmatch(r"[A-Za-z][A-Za-z -]{1,29}", lang):
+        env["COPY_LANGUAGE"] = lang
+        print(f"[copy-language] job={job_id} {lang}")
+
+    # Audio pitch shift in semitones, applied when each clip is cut from the
+    # source (ffmpeg_utils.pitch_filter clamps it to +-6).
+    try:
+        semis = float(pitch) if pitch not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        semis = 0.0
+    if semis:
+        env["AUDIO_PITCH_SEMITONES"] = str(semis)
+        print(f"[pitch] job={job_id} {semis:+g} semitones")
 
     # Manual generation controls (discussion #65): optional clip-count target
     # and duration band, forwarded to the selection prompts via the same env

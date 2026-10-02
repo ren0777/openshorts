@@ -25,6 +25,7 @@ import active_speaker
 import camera_inset
 import punch_in
 import screencast_layout
+import hardsubs
 import layout_ranges
 import split_layout
 from ffmpeg_utils import (video_encode_args, escape_filter_value, QUALITY_FAST,
@@ -135,7 +136,8 @@ def full_width_content_height(orig_w, orig_h, out_w):
     return fg_h + (fg_h % 2)
 
 
-def general_filtergraph(out_w, out_h, content_h=None, orig_w=None, orig_h=None):
+def general_filtergraph(out_w, out_h, content_h=None, orig_w=None, orig_h=None,
+                        bg_trim_bottom=0.0, bg_sigma=12):
     """Blurred-background 'general shot' layout: bg fills the frame (centre-
     cropped, blurred), fg is scaled to a readable share of the height and
     centred, overflowing the sides rather than floating small in the middle.
@@ -150,15 +152,23 @@ def general_filtergraph(out_w, out_h, content_h=None, orig_w=None, orig_h=None):
     by overflowing the sides; on a portrait one the same number is a shrink —
     an already-9:16 upload came back as a 453px sliver floating over a blurred
     copy of itself. Filling the width is the floor, never the target.
+
+    ``bg_trim_bottom`` builds the blurred background from the frame minus that
+    fraction of its bottom. A source with burned-in subtitles otherwise repeats
+    the line behind the real one at 1.8x, half cut off and still readable
+    through sigma 12, which is the exact artifact keeping them was meant to
+    avoid.
     """
     fg_h = content_h if content_h else int(out_h * GENERAL_CONTENT_HEIGHT_RATIO)
     if orig_w and orig_h:
         fg_h = max(fg_h, full_width_content_height(orig_w, orig_h, out_w))
     fg_h += fg_h % 2
+    trim = (f"crop=iw:trunc(ih*{1 - bg_trim_bottom:.3f}/2)*2:0:0,"
+            if bg_trim_bottom > 0 else "")
     return (
         f"[0:v]split=2[bga][fga];"
-        f"[bga]scale=-2:{out_h},crop=w=min(iw\\,{out_w}):h={out_h},"
-        f"scale={out_w}:{out_h},gblur=sigma=12[bg];"
+        f"[bga]{trim}scale=-2:{out_h},crop=w=min(iw\\,{out_w}):h={out_h},"
+        f"scale={out_w}:{out_h},gblur=sigma={bg_sigma}[bg];"
         # Scale by HEIGHT, then trim any overflow to the output width. crop
         # centres by default, and min() makes it a no-op when the scaled source
         # is already narrower than the frame (portrait/square sources).
@@ -393,6 +403,14 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
         content_ranges = []
         print(f"   ↕️  Source is already {orig_w}x{orig_h} vertical — "
               f"passing it through, no reframe")
+    elif hardsubs.mode_from_env() == "keep":
+        # Original subtitles stay: full width wherever a line is on screen,
+        # the full-screen crop where nobody is talking. No layout upgrades,
+        # they would crop the line again.
+        strategies = hardsubs.keep_strategies(input_video, scene_boundaries, fps)
+        content_ranges = []
+        print(f"   💬 Keeping original subtitles: "
+              f"{strategies.count('WIDE')}/{len(strategies)} scene(s) full width")
     else:
         strategies = m.analyze_scenes_strategy(input_video, scenes)
 
@@ -403,7 +421,8 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
     # that begin past the last decoded frame, and those get dropped).
     splits = {}
     split_scene_of = {}
-    detected_splits = {} if passthrough else split_layout.detect_split_scenes(
+    keep_subs = hardsubs.mode_from_env() == "keep" and not force_strategy
+    detected_splits = {} if (passthrough or keep_subs) else split_layout.detect_split_scenes(
         input_video, scenes, strategies)
     for scene_idx, centres in detected_splits.items():
         strategies[scene_idx] = 'SPLIT'
@@ -537,9 +556,12 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
                 graph = screencast_layout.screencast_filtergraph(
                     orig_w, orig_h, out_w, out_h, screencasts[start_f])
             elif strategy == 'WIDE':
+                subs_kept = hardsubs.mode_from_env() == "keep"
                 graph = general_filtergraph(
                     out_w, out_h,
-                    full_width_content_height(orig_w, orig_h, out_w))
+                    full_width_content_height(orig_w, orig_h, out_w),
+                    bg_trim_bottom=0.3 if subs_kept else 0.0,
+                    bg_sigma=30 if subs_kept else 12)
             elif strategy == 'SPLIT':
                 left, right = splits[start_f]
                 graph = split_layout.split_filtergraph(

@@ -1,5 +1,10 @@
 # OpenShorts.app
 
+> **This is a fork of [mutonby/openshorts](https://github.com/mutonby/openshorts).**
+> It adds burned-in subtitle removal for anime, a separate hook/title language,
+> audio pitch shift, better Japanese/CJK and non-Latin support, and a local GPU
+> setup. See **[FORK_FEATURES.md](FORK_FEATURES.md)** for the full list.
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Open Source](https://badges.frapsoft.com/os/v1/open-source.svg?v=103)](https://opensource.org/)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](http://makeapullrequest.com)

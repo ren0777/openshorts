@@ -1,0 +1,47 @@
+# Local-only override: run the backend with CUDA (faster-whisper on the GPU,
+# NVENC for ffmpeg encodes) instead of the default CPU image. Not for
+# production — prod/cloud builds are driven by Coolify, not this file.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+#
+# WHISPER_COMPUTE=int8_float16 trades a little transcription accuracy for
+# headroom: on a 4GB card (RTX 2050) that leaves room for the YOLOv8 fallback
+# tracker and NVENC to share VRAM with faster-whisper's "small" model without
+# hitting OOM. Bump to float16 if you watch VRAM usage and see room to spare.
+services:
+  backend:
+    build:
+      args:
+        GPU: "1"
+    environment:
+      - WHISPER_DEVICE=cuda
+      - WHISPER_COMPUTE=int8_float16
+      # medium over the "small" default: measurably better on accented and
+      # code-switched speech, and at int8_float16 it still fits the 2050's 4GB
+      # alongside YOLO and NVENC. ~0.15x realtime on this card.
+      - WHISPER_MODEL=medium
+      # ffmpeg_utils defaults to x264, so without this every encode (reframe,
+      # hook overlay, subtitle burn) runs on the CPU even on a GPU build —
+      # which is most of the render phase. "auto" probes h264_nvenc once and
+      # falls back to x264 on its own if the card can't do it.
+      - FFMPEG_ENCODER=auto
+      # Source content here is Hindi-English "Hinglish". Translating rather
+      # than transcribing keeps subtitles in Latin script (no Devanagari font
+      # needed) without forcing the model off-distribution the way a fixed
+      # source language does.
+      - WHISPER_TASK=translate
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Windows reserves scattered ports in the Hyper-V dynamic range, and 3100
+  # lands inside it after a WSL restart — the bind then fails with a socket
+  # access error and takes the whole `up` with it. Nothing needs the renderer
+  # from the host: the backend reaches it in-network as http://renderer:3100.
+  renderer:
+    ports: !override []

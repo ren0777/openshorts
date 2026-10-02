@@ -67,7 +67,7 @@ const swatchClass = (selected) =>
 
 export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll, onRemove, isProcessing, videoUrl, jobId, clipIndex, existingHook, bulkCount = 0, bulkProgress }) {
     const [position, setPosition] = useState('bottom');
-    const [fontSize] = useState(24);
+    const [fontSize, setFontSize] = useState(18);
     const [fontName, setFontName] = useState('Verdana');
     const [fontColor, setFontColor] = useState('#FFFFFF');
     const [highlightColor, setHighlightColor] = useState('#FFDD00');
@@ -98,6 +98,12 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
         setBgOpacity(0);
         // Keep the Remotion preview roughly in sync with the burned look
         setAnimation(p.style === 'karaoke' ? (p.effect === 'pop' ? 'pop' : p.effect === 'glow' ? 'word-highlight' : 'karaoke') : 'none');
+    };
+
+    const handleFontSizeChange = (value) => {
+        const parsed = Number.parseInt(value, 10);
+        if (Number.isNaN(parsed)) return;
+        setFontSize(Math.min(36, Math.max(12, parsed)));
     };
 
     // Remotion preview state
@@ -187,7 +193,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
     const fallbackPreviewStyle = {
         fontFamily: fontName,
         color: fontColor,
-        fontSize: '20px',
+        fontSize: `${fontSize}px`,
         fontWeight: 'bold',
         maxWidth: '85%',
         padding: '6px 12px',
@@ -343,6 +349,37 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                                     <option key={f.value} value={f.value} style={{ fontFamily: f.value }}>{f.label}</option>
                                 ))}
                             </select>
+                        </div>
+
+                        {/* Font Size */}
+                        <div>
+                            <div className="flex justify-between mb-2">
+                                <p className="eyebrow">Font size</p>
+                                <span className="readout">{fontSize}px</span>
+                            </div>
+                            <div className="flex items-center gap-3">
+                                <input
+                                    type="range"
+                                    min="12"
+                                    max="36"
+                                    value={fontSize}
+                                    onChange={(e) => handleFontSizeChange(e.target.value)}
+                                    className="w-full accent-[var(--color-accent)]"
+                                />
+                                <input
+                                    type="number"
+                                    min="12"
+                                    max="36"
+                                    value={fontSize}
+                                    onChange={(e) => handleFontSizeChange(e.target.value)}
+                                    className="input-field w-16 px-2 py-1 text-center"
+                                    aria-label="Font size"
+                                />
+                            </div>
+                            <div className="flex justify-between mt-1">
+                                <span className="readout">Small</span>
+                                <span className="readout">Large</span>
+                            </div>
                         </div>
 
                         {/* Text Color */}

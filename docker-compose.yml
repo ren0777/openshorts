@@ -16,7 +16,7 @@ services:
       target: dev
     container_name: openshorts-frontend
     ports:
-      - "5175:5173"
+      - "6100:5173"
     volumes:
       - ./dashboard:/app
       - /app/node_modules

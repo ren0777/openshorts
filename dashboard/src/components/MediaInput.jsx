@@ -36,6 +36,20 @@ export default function MediaInput({ onProcess, isProcessing }) {
     const [layout, setLayout] = useState(() => {
         try { return localStorage.getItem('os_layout') || 'auto'; } catch { return 'auto'; }
     });
+    // Subtitles burned into the source (anime rips): the 9:16 crop cuts them
+    // in half, so they can be cropped off or erased before the reframe.
+    const [hardsubs, setHardsubs] = useState(() => {
+        try { return localStorage.getItem('os_hardsubs') || 'off'; } catch { return 'off'; }
+    });
+    // Hook/title language: '' follows the audio; 'English' for a foreign
+    // video clipped for an English audience.
+    const [copyLanguage, setCopyLanguage] = useState(() => {
+        try { return localStorage.getItem('os_copy_language') || ''; } catch { return ''; }
+    });
+    // Audio pitch shift in semitones ('0' = untouched).
+    const [pitch, setPitch] = useState(() => {
+        try { return localStorage.getItem('os_pitch') || '0'; } catch { return '0'; }
+    });
     const infoRef = useRef(null);
 
     // Close the compatibility popover on any outside click.
@@ -85,11 +99,17 @@ export default function MediaInput({ onProcess, isProcessing }) {
             autoHook,
             autoHookStyle,
             layout,
+            hardsubs,
+            copyLanguage,
+            pitch,
         };
         try {
             localStorage.setItem('os_auto_hook', autoHook ? '1' : '0');
             localStorage.setItem('os_auto_hook_style', autoHookStyle);
             localStorage.setItem('os_layout', layout);
+            localStorage.setItem('os_hardsubs', hardsubs);
+            localStorage.setItem('os_copy_language', copyLanguage);
+            localStorage.setItem('os_pitch', pitch);
         } catch { /* ignore */ }
         if (mode === 'url' && url) {
             onProcess({ type: 'url', payload: url, acknowledged: true, outputFormat, ...advanced });
@@ -307,6 +327,46 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                     <option value="split">Two speakers stacked</option>
                                     <option value="screencast">Screen over presenter</option>
                                     <option value="none">Single crop only</option>
+                                </select>
+                            </div>
+                            <div className="col-span-1 sm:col-span-3 flex flex-wrap items-center justify-between gap-3 pt-3 sm:pt-1 border-t border-rule">
+                                <span className="text-xs text-ink2">burned-in subtitles</span>
+                                <select
+                                    value={hardsubs}
+                                    onChange={(e) => setHardsubs(e.target.value)}
+                                    className="input-field !w-auto text-xs py-1.5"
+                                    aria-label="burned-in subtitles"
+                                >
+                                    <option value="off">Keep (source has none)</option>
+                                    <option value="keep">Keep original subtitles (full width when shown)</option>
+                                    <option value="crop">Remove: crop the subtitle band</option>
+                                    <option value="inpaint">Remove: erase, keep full picture</option>
+                                </select>
+                            </div>
+                            <div className="col-span-1 sm:col-span-3 flex flex-wrap items-center justify-between gap-3 pt-3 sm:pt-1 border-t border-rule">
+                                <span className="text-xs text-ink2">hook &amp; title language</span>
+                                <select
+                                    value={copyLanguage}
+                                    onChange={(e) => setCopyLanguage(e.target.value)}
+                                    className="input-field !w-auto text-xs py-1.5"
+                                    aria-label="hook and title language"
+                                >
+                                    <option value="">Same as the video</option>
+                                    <option value="English">English</option>
+                                </select>
+                            </div>
+                            <div className="col-span-1 sm:col-span-3 flex flex-wrap items-center justify-between gap-3 pt-3 sm:pt-1 border-t border-rule">
+                                <span className="text-xs text-ink2">audio pitch</span>
+                                <select
+                                    value={pitch}
+                                    onChange={(e) => setPitch(e.target.value)}
+                                    className="input-field !w-auto text-xs py-1.5"
+                                    aria-label="audio pitch"
+                                >
+                                    <option value="0">Original</option>
+                                    <option value="1">Slightly higher (+1)</option>
+                                    <option value="2">Higher (+2)</option>
+                                    <option value="3">Much higher (+3)</option>
                                 </select>
                             </div>
                             <div className="col-span-1 sm:col-span-3 flex flex-wrap items-center justify-between gap-3 pt-3 sm:pt-1 border-t border-rule">

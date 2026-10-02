@@ -35,6 +35,12 @@ dashboard/node_modules/
 *.gif
 videos/
 
+# Runtime dirs the container writes into via the docker-compose bind mount
+# (.:/app) — job output and the Hugging Face/Whisper model cache land here on
+# the host, not just in the image, and can grow to hundreds of MB.
+output/
+.cache/
+
 # Model files (downloaded at build time)
 *.pt
 

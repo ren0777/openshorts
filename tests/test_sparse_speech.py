@@ -47,3 +47,15 @@ class TestEdges:
     def test_zero_duration_does_not_divide_by_zero(self):
         assert main.speech_is_sparse(_t("hi"), 0)
         assert not main.speech_is_sparse(_t(*["a b c d e f g h i j"] * 3), 0)
+
+
+class TestUnspacedScripts:
+    def test_japanese_dialogue_is_not_sparse(self):
+        # A One Piece episode: spaceless lines that split() counted as one
+        # word each, sending a talky 24-minute episode down the silent path.
+        lines = ["この様子が変だ。みんなを避難させろ。", "ヤルル様もお逃げください!",
+                 "戦士に逃げろなどと言うもんじゃない!"] * 30
+        assert not main.speech_is_sparse(_t(*lines), 1416)
+
+    def test_a_single_japanese_interjection_is_still_sparse(self):
+        assert main.speech_is_sparse(_t("うう。"), 600)

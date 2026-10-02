@@ -38,6 +38,11 @@ WORKDIR /app
 # Install FFmpeg, OpenCV deps, Node.js + npm + git (for yt-dlp JS + bgutil build).
 # fontconfig + fonts-liberation back the subtitle font choices: without real
 # fonts libass falls back to DejaVu for every UI option (issue #57).
+# fonts-noto-core adds the non-Latin scripts (Devanagari, Arabic, Thai, Bengali,
+# Tamil, etc.) that the translate.py dubbing languages actually need — without
+# it libass has no glyphs for those codepoints and burns in tofu boxes (□□□□)
+# instead of Hindi/etc. subtitles. Deliberately not fonts-noto-cjk (~150MB+)
+# until a real CJK caption request justifies the image size.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     curl \
@@ -52,6 +57,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fontconfig \
     fonts-liberation \
     fonts-noto-color-emoji \
+    fonts-noto-core \
     && rm -rf /var/lib/apt/lists/*
 
 # Deno JS runtime — required by yt-dlp for some extractor challenges.

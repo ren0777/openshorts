@@ -137,6 +137,36 @@ LLM it logs one line and keeps the transcript hook. `HOOK_GROUNDING=0`
 disables it. The detail prompt itself now carries the rule "about this
 moment, not the video", which is the cheap half of the same fix.
 
+### Burned-in subtitles (`hardsubs.py`)
+
+Anime rips carry their subtitles in the pixels, and the 9:16 crop cuts those
+lines in half under our own captions. `POST /api/process` takes `hardsubs`
+(`crop` | `inpaint` | `keep`, sets `HARDSUBS` for the job; dashboard: advanced
+options → "burned-in subtitles"). `keep` leaves the original lines and frames
+around them instead: `reframe_v2` renders each scene WIDE when subtitles show
+up in it and TRACK (fill the frame) when nobody is talking, skips the split /
+screencast upgrades, and the job runs with `AUTO_CAPTIONS=0`. The other two
+run on each cut clip **before** the reframe:
+`crop` drops the measured subtitle band (no artifacts, loses the bottom
+~15-25%), `inpaint` paints the glyphs out with OpenCV Telea (full picture,
+a faint smudge, ~1 min per clip on CPU). Detection is geometric, not OCR: thin
+bright strokes, a mostly-dark ring around each glyph, at least four glyphs on
+one baseline, bottom 40% of the frame only. A clip with no subtitles found
+is left untouched. Pair it with `WHISPER_TASK=translate` to caption Japanese
+audio in English. Not applied by the source-path recut (`recut.py`) yet.
+
+`copy_language` on `/api/process` (env `COPY_LANGUAGE`, dashboard "hook &
+title language") sets the language of hook, title and descriptions apart from
+the transcript's (`main.copy_language`, also read by `hook_grounding`). The
+hook fonts carry no CJK; `hooks.py` switches to a CJK font when one is
+installed and warns otherwise, since the image ships without fonts-noto-cjk.
+
+`pitch` on `/api/process` (semitones, env `AUDIO_PITCH_SEMITONES`, dashboard
+"audio pitch") shifts the voice with ffmpeg `rubberband`, tempo untouched so
+it stays in sync with burned-in subtitles. Applied only in `cut_clip`
+(`audio_encode_args(pitch=True)`): every later re-encode starts from an
+already shifted clip and must not stack it.
+
 ### Local LLM for the moment picker (`llm_backend.py`)
 
 `LLM_BASE_URL` (+ `LLM_MODEL`, `LLM_API_KEY`) routes the two transcript

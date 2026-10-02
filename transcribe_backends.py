@@ -172,9 +172,15 @@ def _transcribe_with_whisper(media_path):
         })
         text_parts.append(segment.text.strip())
 
+    # info.language is the language Whisper HEARD, but under task="translate"
+    # every segment above is already English. Reporting the source here sends
+    # Gemini a transcript full of English with a "hi" label, and the hook prompt
+    # ("same language as the transcript") then writes Devanagari over English
+    # subtitles — which the image has no font for, so it burns in as boxes.
+    translating = WHISPER_TRANSCRIBE_PARAMS.get("task") == "translate"
     return {
         "text": " ".join(part for part in text_parts if part),
-        "language": info.language,
+        "language": "en" if translating else info.language,
         "segments": out_segments,
     }
 

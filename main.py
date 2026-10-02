@@ -1582,7 +1582,7 @@ def get_viral_clips(transcript_result, video_duration):
     the expensive detail reasoning focused on the shortlist. Cuts are snapped to
     word boundaries so clips don't start/end mid-word.
     """
-    language = str(transcript_result.get('language') or 'unknown')
+    language = copy_language(str(transcript_result.get('language') or 'unknown'))
     if llm_backend.active():
         # Self-hosted text model: no Google key needed for this stage.
         client = None
@@ -1713,9 +1713,31 @@ MIN_SPEECH_WORDS_PER_MIN = float(os.environ.get("MIN_SPEECH_WORDS_PER_MIN", "5")
 MIN_SPEECH_WORDS = int(os.environ.get("MIN_SPEECH_WORDS", "8"))
 
 
+# Japanese, Chinese and Korean are counted by character: Japanese and Chinese
+# put no spaces between words, so split() read a full anime episode (~1,400
+# lines of dialogue) as 87 "words" and sent it to the silent-video path, which
+# clipped the opening song. ~2 characters per word is close enough for a floor.
+_CJK_CHARS = re.compile(r"[぀-ヿ㐀-䶿一-鿿가-힯]")
+
+
+def _spoken_words(text):
+    text = text or ""
+    return max(len(text.split()), len(_CJK_CHARS.findall(text)) // 2)
+
+
+def copy_language(transcript_language):
+    """Language the hook, title and descriptions are written in.
+
+    COPY_LANGUAGE (per job) overrides the transcript's: a Japanese anime
+    clipped for an English audience needs English copy, and the hook fonts
+    carry no CJK glyphs, so a Japanese hook burned in as boxes.
+    """
+    return (os.environ.get("COPY_LANGUAGE") or "").strip() or transcript_language
+
+
 def speech_is_sparse(transcript, duration):
     """True when the transcript is too thin to drive clip selection."""
-    words = sum(len((seg.get("text") or "").split())
+    words = sum(_spoken_words(seg.get("text"))
                 for seg in (transcript or {}).get("segments", []))
     minutes = max(float(duration or 0) / 60.0, 1e-6)
     return words < MIN_SPEECH_WORDS or words / minutes < MIN_SPEECH_WORDS_PER_MIN
@@ -1957,7 +1979,8 @@ if __name__ == '__main__':
         if transcript is not None:
             clips_data = get_viral_clips(transcript, duration)
         else:
-            clips_data = get_visual_clips(input_video, duration)
+            clips_data = get_visual_clips(input_video, duration,
+                                          language=copy_language("en"))
 
         if not clips_data or 'shorts' not in clips_data:
             # Deliberately fail instead of reframing the whole video: that path
@@ -1998,6 +2021,11 @@ if __name__ == '__main__':
                 try:
                     # ffmpeg cut — re-encoding for precision on strict seconds
                     cut_clip(input_video, clip_temp_path, start, end, i + 1)
+                    # Burned-in subtitles (anime rips) come out half-cropped
+                    # by the 9:16 crop: remove them before the reframe sees
+                    # the picture. Our own captions go on later as usual.
+                    import hardsubs
+                    hardsubs.clean(clip_temp_path)
 
                     success = render_clip(clip_temp_path, clip_final_path, output_format)
                     # Layer order: watermark burns into the canonical (so any

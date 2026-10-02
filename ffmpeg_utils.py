@@ -134,11 +134,38 @@ def mark_ai_generated(path, detail=""):
         return False
 
 
-def audio_encode_args():
-    """AAC encode args for a delivered clip, with loudness normalisation."""
-    args = ["-c:a", "aac"]
+def pitch_filter():
+    """rubberband filter for the job's AUDIO_PITCH_SEMITONES, or None.
+
+    rubberband shifts pitch without touching tempo, so the audio stays in sync
+    with the picture and with any subtitles burned into it. Clamped to +-6
+    semitones: past that a voice stops sounding like the same person.
+    """
+    try:
+        semis = float(os.environ.get("AUDIO_PITCH_SEMITONES", "0") or 0)
+    except ValueError:
+        return None
+    semis = max(-6.0, min(6.0, semis))
+    if abs(semis) < 0.05:
+        return None
+    return f"rubberband=pitch={2 ** (semis / 12):.5f}"
+
+
+def audio_encode_args(pitch=False):
+    """AAC encode args for a delivered clip, with loudness normalisation.
+
+    ``pitch`` applies the job's pitch shift. Only the cut from the SOURCE asks
+    for it: every later step re-encodes an already shifted clip, and shifting
+    there too would stack the change once per edit.
+    """
+    filters = []
+    if pitch and pitch_filter():
+        filters.append(pitch_filter())
     if os.environ.get("AUDIO_NORMALIZE", "1").strip() != "0":
-        args = ["-af", LOUDNORM_FILTER] + args
+        filters.append(LOUDNORM_FILTER)
+    args = ["-c:a", "aac"]
+    if filters:
+        args = ["-af", ",".join(filters)] + args
     return args
 
 _probe_lock = threading.Lock()
@@ -265,7 +292,7 @@ def cut_clip(input_video, clip_temp_path, start, end, clip_number):
         '-to', str(end),
         '-i', input_video,
         *encode_args,
-        *audio_encode_args(),
+        *audio_encode_args(pitch=True),
         clip_temp_path
     ]
 

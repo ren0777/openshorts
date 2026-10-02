@@ -26,11 +26,17 @@ def get_whisper_config():
 
 # Decode params shared by both transcription paths. condition_on_previous_text
 # is off to avoid repetition/hallucination loops; vad_filter drops silence.
+# WHISPER_TASK=translate makes Whisper emit English for any spoken language,
+# using the translation head it was actually trained for. Forcing the source
+# language to English instead (language="en" on Hindi audio) also yields Latin
+# script but is off-distribution: the small model degenerates into mixed
+# Devanagari/Cyrillic/replacement-char token soup on stretches it cannot place.
 WHISPER_TRANSCRIBE_PARAMS = {
     "beam_size": 5,
     "vad_filter": True,
     "condition_on_previous_text": False,
     "word_timestamps": True,
+    "task": os.environ.get("WHISPER_TASK", "transcribe"),
 }
 
 
@@ -240,11 +246,11 @@ AUTO_CAPTION_STYLE = {
     "style": "karaoke",
     "alignment": "bottom",
     "font_name": "Anton",
-    "font_size": 44,
+    "font_size": 18,
     "font_color": "#FFFFFF",
     "highlight_color": "#FFE500",
     "border_color": "#000000",
-    "border_width": 4,
+    "border_width": 3,
     "effect": "pop",
     "base_opacity": 1.0,
     "uppercase": True,

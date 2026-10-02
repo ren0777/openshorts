@@ -47,6 +47,30 @@ _EMOJI_FONT_CANDIDATES = [
 ]
 
 
+# Japanese / Chinese / Korean: NotoSerif has none of it either, and a hook in
+# the transcript's language on an anime burned in as a row of boxes. Used for
+# the whole hook when it contains CJK (these fonts carry Latin too).
+_CJK_RE = re.compile(r"[぀-ヿ㐀-䶿一-鿿가-힯＀-￯]")
+_CJK_FONT_CANDIDATES = [
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc",
+    "C:\\Windows\\Fonts\\YuGothB.ttc",
+    "C:\\Windows\\Fonts\\msgothic.ttc",
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+]
+
+
+def _load_cjk_font(font_size):
+    for path in _CJK_FONT_CANDIDATES:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, font_size)
+            except Exception:
+                continue
+    return None
+
+
 # Bitmap strike sizes color-emoji fonts ship with. NotoColorEmoji (the font
 # the Docker image installs) ONLY loads at its strike size — asking for an
 # arbitrary size raises "invalid pixel size" — so glyphs are rendered at the
@@ -237,6 +261,15 @@ def create_hook_image(text, target_width, output_image_path="hook_overlay.png", 
     except Exception as e:
         print(f"⚠️ Warning: Could not load font {FONT_PATH}, using default. Error: {e}")
         font = ImageFont.load_default()
+
+    if _CJK_RE.search(text):
+        cjk_font = _load_cjk_font(font_size)
+        if cjk_font is not None:
+            font = cjk_font
+        else:
+            print("⚠️ Hook text is Japanese/Chinese/Korean but no CJK font is "
+                  "installed: it will render as boxes. Set the hook language "
+                  "to English, or install fonts-noto-cjk.")
 
     # Emoji handling: render with an emoji-capable font if one exists,
     # otherwise strip emoji instead of drawing tofu boxes.

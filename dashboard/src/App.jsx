@@ -712,8 +712,12 @@ function App() {
   // `keysMissing` now means "self-host BYOK keys missing" — it never fires on hosted.
   // A self-hosted server running the moment picker on a local LLM
   // (LLM_BASE_URL) does not need a Gemini key for the core pipeline.
+  // Upload-Post is NOT gated here: it only publishes finished clips to social
+  // (an optional, later step per CLAUDE.md's pipeline), so it must not block
+  // clip generation itself. Actions that actually need it (publish/schedule)
+  // check uploadPostKey directly at the point of use instead.
   const geminiOk = !!apiKey || !!localLlm;
-  const keysMissing = !billingEnabled && (!geminiOk || !uploadPostKey);
+  const keysMissing = !billingEnabled && !geminiOk;
   const needsPlan = billingEnabled && !isManaged;   // hosted, signed-out or no active plan/trial
 
   // Fresh sign-up: Clip Generator tutorial (AuthContext set os_show_clip_tutorial
@@ -864,6 +868,9 @@ function App() {
         auto_hook_style: data.autoHook ? (data.autoHookStyle || 'classic') : null,
         // 'auto' is the server default, so only a deliberate choice travels.
         layouts: data.layout && data.layout !== 'auto' ? data.layout : null,
+        hardsubs: data.hardsubs && data.hardsubs !== 'off' ? data.hardsubs : null,
+        copy_language: data.copyLanguage || null,
+        pitch: data.pitch && data.pitch !== '0' ? data.pitch : null,
       };
 
       if (data.type === 'url') {
